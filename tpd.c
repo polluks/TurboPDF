@@ -135,6 +135,12 @@ static HPDF_Doc            g_doc;        /* current PDF document   */
 static struct IORequest   *g_req;        /* current IORequest      */
 static int                 g_npages;     /* pages in current doc   */
 
+/* Per-page band accumulation (Render path) */
+static UBYTE              *g_rowbuf;     /* accumulated RGB24 rows */
+static ULONG               g_rowbufsz;   /* allocated bytes        */
+static ULONG               g_rowstride;  /* bytes per row (w * 3)  */
+static ULONG               g_nrows;      /* rows accumulated so far*/
+
 /* ------------------------------------------------------------------
  *  PDF helpers
  * ------------------------------------------------------------------ */
@@ -322,64 +328,102 @@ static int ped_render(struct RastPort *rp,
                       ULONG c, ULONG x, ULONG y, ULONG status)
 {
     struct BitMap  *bm;
-    UWORD           w, h, bpp;
-    UBYTE          *rgb;
+    ULONG           stride, band_h, need;
+    UBYTE          *src, *dst;
     HPDF_BYTE      *jpeg;
     HPDF_UINT32     jsz;
-    int             quality;
 
     (void)x;
-    (void)y;
     (void)status;
 
     switch (c) {
 
-    case 0:                     /* pre-master init */
+    /* pre-master init — reset band accumulation */
+    case 0:
+        g_rowbuf   = NULL;
+        g_rowbufsz = 0;
+        g_rowstride = 0;
+        g_nrows    = 0;
         return 0;
 
-    case 1: {                   /* scale, dither & render */
+    /* scale, dither & render — accumulate one band */
+    case 1: {
         if (!rp || !rp->BitMap)
             return -1;
 
-        bm  = rp->BitMap;
-        w   = bm->BytesPerRow * 8;          /* rough width  */
-        h   = bm->Rows;                     /* rough height */
-        bpp = 24;                           /* assume chunky */
+        bm     = rp->BitMap;
+        band_h = y;                          /* rows in this band */
+        stride = bm->BytesPerRow;
 
-        /* Allocate RGB24 buffer */
-        rgb = AllocVec((ULONG)w * h * 3, MEMF_ANY);
-        if (!rgb) return -1;
+        if (band_h == 0 || stride == 0)
+            return -1;
 
-        /* FIXME: planar → RGB conversion needed for classic Amiga
-         * bitmaps.  On MorphOS/CGX the bitmap is likely chunky and
-         * we can read pixel data directly.  For now we just fill
-         * with a placeholder so the pipeline compiles. */
-        {
-            int i;
-            for (i = 0; i < w * h * 3; i++)
-                rgb[i] = 0x80;
+        /* Expand accumulation buffer if needed */
+        need = stride * (g_nrows + band_h);
+        if (need > g_rowbufsz) {
+            UBYTE *nb = AllocVec(need, MEMF_ANY);
+            if (!nb) return -1;
+            if (g_rowbuf) {
+                CopyMem(g_rowbuf, nb, g_rowbufsz);
+                FreeVec(g_rowbuf);
+            }
+            g_rowbuf   = nb;
+            g_rowbufsz = need;
+        }
+        g_rowstride = stride;
+
+        dst = g_rowbuf + g_nrows * stride;
+
+        /* Read pixel data from the bitmap.
+         * One plane → chunky (CGX/MorphOS).  Multiple planes → planar
+         * (classic Amiga).  For now handle chunky; planar is stubbed. */
+        if (bm->Depth == 1) {
+            /* Chunky — pixel data lives in Planes[0] */
+            src = bm->Planes[0];
+            if (src)
+                CopyMem(src + g_nrows * stride, dst, stride * band_h);
+            else
+                SetMem(dst, 0x80, stride * band_h);
+        } else {
+            /* Planar — FIXME: implement proper planar→RGB conversion */
+            SetMem(dst, 0x80, stride * band_h);
         }
 
-        quality = 90;
-        jpeg    = NULL;
-        jsz     = 0;
+        g_nrows += band_h;
+        return 0;
+    }
 
-        if (rgb_to_jpeg(rgb, w, h, quality, &jpeg, &jsz) == 0 && jpeg) {
+    /* output buffer — compress accumulated rows to JPEG, add to PDF */
+    case 2: {
+        ULONG w, h;
+        if (!g_rowbuf || g_nrows == 0 || g_rowstride == 0)
+            return -1;
+
+        w = g_rowstride / 3;                 /* pixels per row */
+        h = g_nrows;                         /* total rows     */
+
+        jpeg = NULL;
+        jsz  = 0;
+
+        if (rgb_to_jpeg(g_rowbuf, w, h, 90, &jpeg, &jsz) == 0 && jpeg) {
             pdf_add_jpeg(w, h, jpeg, jsz);
             FreeVec(jpeg);
         }
 
-        FreeVec(rgb);
+        FreeVec(g_rowbuf);
+        g_rowbuf   = NULL;
+        g_rowbufsz = 0;
+        g_rowstride = 0;
+        g_nrows    = 0;
         return 0;
     }
 
-    case 2:                     /* output buffer */
+    /* post-master */
+    case 3:
         return 0;
 
-    case 3:                     /* post-master */
-        return 0;
-
-    case 4:                     /* CR */
+    /* CR */
+    case 4:
         return 0;
     }
 
