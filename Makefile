@@ -1,5 +1,5 @@
 TARGET  = TurboPDF.tpd
-OBJECTS = device.o
+OBJECTS = tpd.o
 SRCDIRS = .
 INCDIRS = .
 
@@ -19,17 +19,18 @@ else
 endif
 
 CFLAGS  = -mcpu=750 -Wall -Wextra -Wno-unused-parameter \
-          -fomit-frame-pointer -nostdlib -nostartfiles \
+          -fomit-frame-pointer -nostartfiles \
           $(addprefix -I,$(INCDIRS)) $(CFLAGS_EXTRA)
-LDFLAGS = -mcpu=750 -nostdlib -nostartfiles \
-          -lhpdf $(LDFLAGS_EXTRA)
+
+LDFLAGS = -mcpu=750 -nostartfiles -Wl,--strip-all \
+          -lhpdf -ljfif $(LDFLAGS_EXTRA)
 
 OBJS    = $(addprefix $(DIR)/,$(OBJECTS))
 
 vpath %.c $(SRCDIRS)
 
 all: $(DIR) $(OBJS)
-	$(LD) $(CFLAGS) -o $(DIR)/$(TARGET) $(OBJS) $(LDFLAGS)
+	$(LD) -o $(DIR)/$(TARGET) $(OBJS) $(LDFLAGS)
 
 $(DIR):
 	@mkdir -p $(DIR)
