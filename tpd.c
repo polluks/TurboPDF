@@ -309,6 +309,7 @@ static int ped_dospecial(struct IORequest *ior)
 
     tp = (struct TPExtIODRP *)ior->io_Data;
     if (!tp) return -1;
+    if (!g_jfifBase) return -1;
 
     if (tp->tpd_Compression == TPFMT_JPEG) {
         pdf_add_jpeg(tp->tpd_Width, tp->tpd_Height,
@@ -320,8 +321,6 @@ static int ped_dospecial(struct IORequest *ior)
     if (tp->tpd_Compression == TPFMT_RGB24) {
         HPDF_BYTE  *jpeg;
         HPDF_UINT32 jsz;
-
-        if (!g_jfifBase) return -1;                 /* jfif.library missing */
 
         jpeg = NULL;
         jsz  = 0;
@@ -337,7 +336,6 @@ static int ped_dospecial(struct IORequest *ior)
         return -1;
     }
 
-    /* Unknown compression — skip */
     return -1;
 }
 
