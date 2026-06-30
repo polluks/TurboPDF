@@ -134,6 +134,7 @@ const struct PrinterSegment sg __attribute__((used, section(".text"))) = {
 static HPDF_Doc            g_doc;        /* current PDF document   */
 static struct IORequest   *g_req;        /* current IORequest      */
 static int                 g_npages;     /* pages in current doc   */
+static struct Library     *g_jfifBase;   /* jfif.library base      */
 
 /* Per-page band accumulation (Render path) */
 static UBYTE              *g_rowbuf;     /* accumulated RGB24 rows */
@@ -247,9 +248,10 @@ static int rgb_to_jpeg(const UBYTE *rgb, int w, int h, int quality,
 static int ped_init(struct PrinterData *pd)
 {
     (void)pd;
-    g_doc    = NULL;
-    g_req    = NULL;
-    g_npages = 0;
+    g_doc      = NULL;
+    g_req      = NULL;
+    g_npages   = 0;
+    g_jfifBase = OpenLibrary("jfif.library", 0);
     return 0;
 }
 
@@ -258,6 +260,10 @@ static void ped_expunge(void)
     if (g_doc) {
         if (g_npages > 0) pdf_output();
         HPDF_FreeDocAll(g_doc);
+    }
+    if (g_jfifBase) {
+        CloseLibrary(g_jfifBase);
+        g_jfifBase = NULL;
     }
     g_doc    = NULL;
     g_req    = NULL;
