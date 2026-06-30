@@ -51,14 +51,14 @@ Output
 
 Supported driver entry points
 
-  +----------+------------------------------------------------------+
-  | Init     | Save PrinterData pointer; reset PDF state            |
-  | Open     | Create new HPDF document                             |
-  | Close    | Flush PDF to stdout; free HPDF document              |
-  | Expunge  | Emergency cleanup if Close wasn't called             |
-  | DoSpecial| Handle PRD_TPEXTDUMPRPORT (TurboPrint JPEG data)    |
-  | Render   | Handle PRD_DUMPRPORT (standard RastPort raster data) |
-  +----------+------------------------------------------------------+
+| Entry | Description |
+|-------|-------------|
+| Init | Save PrinterData pointer; reset PDF state |
+| Open | Create new HPDF document |
+| Close | Flush PDF to stdout; free HPDF document |
+| Expunge | Emergency cleanup if Close wasn't called |
+| DoSpecial | Handle PRD_TPEXTDUMPRPORT (TurboPrint JPEG data) |
+| Render | Handle PRD_DUMPRPORT (standard RastPort raster data) |
 
 Struct packing
   The `PrinterSegment` and `PrinterExtendedData` structs are defined
