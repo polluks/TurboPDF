@@ -114,5 +114,4 @@ TODO
 
 [ ] Test on real MorphOS hardware.
 [ ] Implement planar → RGB conversion in Render() for classic Amiga bitmaps.
-[ ] Handle TPFMT_RGB24 in DoSpecial (compress with libjfif).
 [ ] Investigate per-PrinterData state for concurrent printer instances.
