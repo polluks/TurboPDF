@@ -67,10 +67,12 @@ Struct packing
   alignment rules.  The `TPExtIODRP` struct is also packed.
 
 Build
+  ```
   make            # release build → build-release/TurboPDF.tpd
   make debug=1    # debug build   → build-debug/TurboPDF.tpd
   make clean
-  (requires ppc-morphos-gcc, morphos-sdk with hpdf.library and jfif.library)
+  ```
+  (requires `ppc-morphos-gcc`, MorphOS SDK with `hpdf.library` and `jfif.library`)
 
 Status
   Untested on real MorphOS hardware.  May need adjustments for
