@@ -347,11 +347,26 @@ init_device(struct ExecBase *sysbase asm("a6"),
             BPTR seglist asm("a0"),
             struct Library *dev asm("d0"))
 {
+    UBYTE *rt = (UBYTE *)&romtag;
+    APTR   p;
+
     SysBase = sysbase;
 #if DEBUG
-    KPrintF("init_device(): turboprint.pdf.device\n");
+    KPrintF("init_device(): TurboPDF.tpd\n");
 #endif
     saved_seg_list = seglist;
+
+    /* Patch romtag fields that need runtime addresses */
+    p = (APTR)&romtag;
+    CopyMem(&p, rt + 2, 4);           /* rt_MatchTag */
+    p = (APTR)romtag + ROMTAG_SIZE;
+    CopyMem(&p, rt + 6, 4);           /* rt_EndSkip */
+    p = (APTR)device_name;
+    CopyMem(&p, rt + 14, 4);          /* rt_Name */
+    p = (APTR)device_id_string;
+    CopyMem(&p, rt + 18, 4);          /* rt_IdString */
+    p = (APTR)auto_init_tables;
+    CopyMem(&p, rt + 22, 4);          /* rt_Init */
 
     dev->lib_Node.ln_Type = NT_DEVICE;
     dev->lib_Node.ln_Name = (STRPTR)DEVICE_NAME;
@@ -373,26 +388,47 @@ static const ULONG auto_init_tables[4] =
 };
 
 /* ---------------------------------------------------------------
- *  Romtag — placed at a fixed section so it appears before any code.
+ *  Romtag — placed at a fixed section so it appears before any
+ *  code.  C's struct Resident has wrong layout on PPC (compiler
+ *  pads APTR fields to 4 bytes), so we build it as a packed byte
+ *  array in the correct m68k/Exec order.
  *
- *  The linker script places .romtag at offset 4 (right after the
- *  _start safety-net).  We use __attribute__((section(".romtag")))
- *  to control placement.
+ *  Layout:
+ *    offset  size  field
+ *       0     2    rt_MatchWord  (RTC_MATCHWORD)
+ *       2     4    rt_MatchTag   (&romtag)
+ *       6     4    rt_EndSkip    (&romtag + 28)
+ *      10     1    rt_Flags      (RTF_AUTOINIT)
+ *      11     1    rt_Version    (DEVICE_VERSION)
+ *      12     1    rt_Type       (NT_DEVICE)
+ *      13     1    rt_Pri        (DEVICE_PRIORITY)
+ *      14     4    rt_Name       (device_name)
+ *      18     4    rt_IdString   (device_id_string)
+ *      22     4    rt_Init       (auto_init_tables)
+ *      26  —— total = 28 bytes
  * --------------------------------------------------------------- */
 
-static const struct Resident romtag
+#define ROMTAG_SIZE  28
+
+static const UBYTE romtag[ROMTAG_SIZE]
 __attribute__((used, section(".romtag"))) =
 {
-    .rt_MatchWord   = RTC_MATCHWORD,
-    .rt_MatchTag    = (APTR)&romtag,
-    .rt_EndSkip     = (APTR)&romtag + sizeof(romtag),
-    .rt_Flags       = RTF_AUTOINIT,
-    .rt_Version     = DEVICE_VERSION,
-    .rt_Type        = NT_DEVICE,
-    .rt_Pri         = DEVICE_PRIORITY,
-    .rt_Name        = device_name,
-    .rt_IdString    = device_id_string,
-    .rt_Init        = (APTR)auto_init_tables
+    (RTC_MATCHWORD >> 8) & 0xFF,
+    (RTC_MATCHWORD)      & 0xFF,
+    /* rt_MatchTag — filled at runtime by init_device */
+    0, 0, 0, 0,
+    /* rt_EndSkip   — filled at runtime by init_device */
+    0, 0, 0, 0,
+    RTF_AUTOINIT,
+    DEVICE_VERSION,
+    NT_DEVICE,
+    DEVICE_PRIORITY,
+    /* rt_Name      — filled at runtime by init_device */
+    0, 0, 0, 0,
+    /* rt_IdString  — filled at runtime by init_device */
+    0, 0, 0, 0,
+    /* rt_Init      — filled at runtime by init_device */
+    0, 0, 0, 0,
 };
 
 /* _start — if someone tries to run the file as a program, return -1 */
