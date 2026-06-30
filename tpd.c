@@ -293,50 +293,109 @@ static void ped_close(struct IORequest *ior)
     g_npages = 0;
 }
 
+/*
+ * Local packed copy of the IODRPReq (printer.device I/O request)
+ * used for PRD_DUMPRPORT / PRD_TPEXTDUMPRPORT.
+ *
+ * We define everything from Message up so the packed layout is
+ * correct regardless of the PPC (MorphOS) ABI.
+ */
+struct PrinterIORP {
+    /* struct Message */
+    APTR   ln_Succ;
+    APTR   ln_Pred;
+    UBYTE  ln_Type;
+    BYTE   ln_Pri;
+    STRPTR ln_Name;
+    APTR   mn_ReplyPort;
+    UWORD  mn_Length;
+    /* struct IORequest */
+    APTR   io_Device;
+    APTR   io_Unit;
+    UWORD  io_Command;
+    UBYTE  io_Flags;
+    UBYTE  io_Error;
+    ULONG  io_Actual;
+    ULONG  io_Length;
+    APTR   io_Data;
+    ULONG  io_Offset;
+    /* struct IODRPReq additions */
+    APTR   io_RastPort;
+    ULONG  io_Modes;
+    ULONG  io_ColorMap;
+    LONG   io_SrcX;
+    LONG   io_SrcY;
+    LONG   io_SrcWidth;
+    LONG   io_SrcHeight;
+    LONG   io_DestCols;
+    LONG   io_DestRows;
+    ULONG  io_Special;
+} __attribute__((packed));
+
 /* ------------------------------------------------------------------
  *  DoSpecial — handles the TurboPrint data path
  *
- *  PRD_TPEXTDUMPRPORT  receives a TPExtIODRP with pre-compressed
- *  JPEG (or RGB24) raster data.  We embed it in the PDF document.
+ *  PRD_TPEXTDUMPRPORT  receives a TPExtIODRP (pointer via io_Modes)
+ *  and the raster bitmap via io_RastPort.  We read the pixel data
+ *  (TPFMT_RGB24 and similar), compress to JPEG and embed in the PDF.
  * ------------------------------------------------------------------ */
 
 static int ped_dospecial(struct IORequest *ior)
 {
-    struct TPExtIODRP *tp;
+    struct PrinterIORP   *req;
+    struct TPExtIODRP    *tp;
+    struct RastPort      *rp;
+    struct BitMap        *bm;
+    UBYTE                *rgb;
+    HPDF_BYTE            *jpeg;
+    HPDF_UINT32           jsz;
+    ULONG                 w, h, stride, y;
 
     if (ior->io_Command != PRD_TPEXTDUMPRPORT)
-        return -1;                          /* not handled */
+        return -1;
 
-    tp = (struct TPExtIODRP *)ior->io_Data;
+    req = (struct PrinterIORP *)ior;
+    tp  = (struct TPExtIODRP *)req->io_Modes;
     if (!tp) return -1;
     if (!g_jfifBase) return -1;
 
-    if (tp->tpd_Compression == TPFMT_JPEG) {
-        pdf_add_jpeg(tp->tpd_Width, tp->tpd_Height,
-                     (HPDF_BYTE *)tp->tpd_Buf,
-                     (HPDF_UINT32)tp->tpd_BufSize);
-        return 0;
-    }
+    rp = (struct RastPort *)req->io_RastPort;
+    if (!rp || !rp->BitMap) return -1;
 
-    if (tp->tpd_Compression == TPFMT_RGB24) {
-        HPDF_BYTE  *jpeg;
-        HPDF_UINT32 jsz;
+    bm     = rp->BitMap;
+    w      = req->io_SrcWidth;
+    h      = req->io_SrcHeight;
+    stride = bm->BytesPerRow;
 
-        jpeg = NULL;
-        jsz  = 0;
-
-        if (rgb_to_jpeg((UBYTE *)tp->tpd_Buf,
-                        tp->tpd_Width, tp->tpd_Height,
-                        90, &jpeg, &jsz) == 0 && jpeg)
-        {
-            pdf_add_jpeg(tp->tpd_Width, tp->tpd_Height, jpeg, jsz);
-            FreeVec(jpeg);
-            return 0;
-        }
+    if (w == 0 || h == 0 || stride == 0)
         return -1;
+
+    /* Allocate RGB24 buffer for the full page */
+    rgb = AllocVec(w * h * 3, MEMF_ANY);
+    if (!rgb) return -1;
+
+    /* Copy pixel data from the chunky bitmap (1 plane = RGB pixels).
+     * FIXME: planar conversion needed for classic Amiga. */
+    if (bm->Depth == 1 && bm->Planes[0]) {
+        for (y = 0; y < h; y++)
+            CopyMem((UBYTE *)bm->Planes[0] + y * stride,
+                    rgb + y * w * 3,
+                    w * 3);
+    } else {
+        SetMem(rgb, 0x80, w * h * 3);
     }
 
-    return -1;
+    /* Compress to JPEG and embed as a new PDF page */
+    jpeg = NULL;
+    jsz  = 0;
+
+    if (rgb_to_jpeg(rgb, w, h, 90, &jpeg, &jsz) == 0 && jpeg) {
+        pdf_add_jpeg(w, h, jpeg, jsz);
+        FreeVec(jpeg);
+    }
+
+    FreeVec(rgb);
+    return (jpeg != NULL) ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------
