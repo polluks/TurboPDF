@@ -1,18 +1,20 @@
 /*
- * TurboPDF.tpd — TurboPrint-compatible printer driver (PrinterSegment)
+ * TurboPDF.tpd -- TurboPrint-compatible printer driver (PrinterSegment)
  * that outputs PDF via libHaru (hpdf.library) to stdout.
  *
- * Pure C — no assembly.  The PrinterSegment + PrinterExtendedData
+ * Pure C -- no assembly.  The PrinterSegment + PrinterExtendedData
  * structs are defined locally with __attribute__((packed)) to match
  * the exact byte layout that printer.device expects on both m68k and
  * PPC (MorphOS).
  *
- * Two data paths:
- *   - PRD_TPEXTDUMPRPORT (TurboPrint, via DoSpecial): receives pre-
- *     compressed JPEG, embeds directly in PDF.
- *   - PRD_DUMPRPORT (standard, via Render): receives planar/chunky
- *     bitmap from RastPort; compresses to JPEG via -ljpeg (jpeg.library),
- *     then embeds in PDF.
+ * Three data paths:
+ *   - Text mode: printable characters arrive via ped_ConvFunc (V34+);
+ *     lines accumulate and are emitted as PDF pages, sized to the
+ *     paper selection from Preferences (US Letter, A4/A5..A0, etc.).
+ *   - PRD_TPEXTDUMPRPORT (TurboPrint, via DoSpecial)
+ *   - PRD_DUMPRPORT (standard, via Render)
+ * The two graphics paths convert the source bitmap to RGB24 and embed
+ * the image in the PDF entirely through libHaru.
  */
 
 #include <exec/types.h>
@@ -20,7 +22,10 @@
 #include <proto/exec.h>
 #include <proto/dos.h>
 
-#include <jpeglib.h>
+#include <intuition/preferences.h>
+
+#include <string.h>
+
 #include <hpdf.h>
 
 #include "turboprint.h"
@@ -28,11 +33,53 @@
 #define STR_(s) #s
 #define STR(s)  STR_(s)
 
-#define DRIVER_VERSION   1
-#define DRIVER_REVISION  0
+#define DRIVER_VERSION   34   /* V34+: device calls ped_ConvFunc for text */
+#define DRIVER_REVISION  1
+
+/* ANSI text command codes (canonical devices/printer.h, aRIS..aRAW).
+ * The Commands table is indexed by these, so they must match the
+ * printer.device constants exactly. */
+#define aRIS    0
+#define aSGR0   5
+#define aSGR3   6
+#define aSGR23  7
+#define aSGR4   8
+#define aSGR24  9
+#define aSGR1   10
+#define aSGR22  11
+#define aRAW    76
+
+/* Paper-size / pitch / spacing codes (intuition/preferences.h).
+ * Local fallbacks so the driver still builds on toolchains whose
+ * Preferences header predates the European sizes. */
+#ifndef US_LETTER
+#define US_LETTER   0x00
+#define US_LEGAL    0x10
+#define N_TRACTOR   0x20
+#define W_TRACTOR   0x30
+#define CUSTOM      0x40
+#define EURO_A0     0x50
+#define EURO_A1     0x60
+#define EURO_A2     0x70
+#define EURO_A3     0x80
+#define EURO_A4     0x90
+#define EURO_A5     0xA0
+#define EURO_A6     0xB0
+#define EURO_A7     0xC0
+#define EURO_A8     0xD0
+#endif
+#ifndef PICA
+#define PICA        0x000
+#define ELITE       0x400
+#define FINE        0x800
+#endif
+#ifndef SIX_LPI
+#define SIX_LPI     0x000
+#define EIGHT_LPI   0x200
+#endif
 
 /* ------------------------------------------------------------------
- *  Packed structs — match the exact m68k byte layout from
+ *  Packed structs -- match the exact m68k byte layout from
  *  devices/prtbase.h.  We define local copies with __attribute__
  *  ((packed)) so the layout is correct on PPC (MorphOS) too.
  * ------------------------------------------------------------------ */
@@ -82,20 +129,43 @@ static int   __attribute__((used)) ped_init(struct PrinterData *pd);
 static void  __attribute__((used)) ped_expunge(void);
 static int   __attribute__((used)) ped_open(struct IORequest *ior);
 static void  __attribute__((used)) ped_close(struct IORequest *ior);
-static int   __attribute__((used)) ped_dospecial(struct IORequest *ior);
+static LONG  __attribute__((used)) ped_dospecial(UWORD *command,
+                                                 UBYTE *out,
+                                                 BYTE *pl_curline,
+                                                 BYTE *pl_spacing,
+                                                 BYTE *pl_crlf,
+                                                 UBYTE *params);
 static int   __attribute__((used)) ped_render(struct RastPort *rp,
                                               ULONG c, ULONG x,
                                               ULONG y, ULONG status);
+static LONG  ped_convfunc(UBYTE *buf, UBYTE c, LONG crlf_flag);
+static void  style_set(UBYTE code);
 
 /* ------------------------------------------------------------------
- *  PrinterSegment header — MUST be the very first thing in the code
+ *  PrinterSegment header -- MUST be the very first thing in the code
  *  hunk.  __attribute__((section(".text"))) places it in the code
  *  section; combined with -nostartfiles it becomes the first word
  *  of the LoadSeg'd module.
  * ------------------------------------------------------------------ */
 
 static const STRPTR sg_name  = "TurboPDF";
-static const APTR   sg_cmds[] = { NULL };
+
+/* Printer escape-command table, indexed by ANSI command code aRIS(0) ..
+ * aRAW(76).  The 0xFF entries route style changes (SGR) to ped_DoSpecial;
+ * everything else stays NULL (ignored -- newline/formfeed handling lives
+ * in ped_ConvFunc).  The table must hold aRAW+1 entries because
+ * printer.device indexes it with the parsed command number.
+ */
+#define TEXT_NUM_CMDS  77
+static const STRPTR sg_cmds[TEXT_NUM_CMDS] = {
+    [aSGR0]  = "\377",   /* all attributes off       */
+    [aSGR1]  = "\377",   /* bold                      */
+    [aSGR22] = "\377",   /* normal intensity          */
+    [aSGR3]  = "\377",   /* italic                    */
+    [aSGR23] = "\377",   /* italic off                */
+    [aSGR4]  = "\377",   /* underline                 */
+    [aSGR24] = "\377",   /* underline off             */
+};
 
 const struct PrinterSegment sg __attribute__((used, section(".text"))) = {
     .ps_NextSegment = 0,
@@ -110,7 +180,7 @@ const struct PrinterSegment sg __attribute__((used, section(".text"))) = {
         .ped_Close        = ped_close,
         .ped_PrinterClass = PPCF_GFX | PPCF_COLOR,
         .ped_ColorClass   = PCC_BW,
-        .ped_MaxColumns   = 0,
+        .ped_MaxColumns   = 80,
         .ped_NumCharSets  = 0,
         .ped_NumRows      = 1,
         .ped_MaxXDots     = 0,
@@ -123,7 +193,7 @@ const struct PrinterSegment sg __attribute__((used, section(".text"))) = {
         .ped_TimeoutSecs  = 120L,
         .ped_8BitChars    = NULL,
         .ped_PrintMode    = 0,
-        .ped_ConvFunc     = NULL,
+        .ped_ConvFunc     = ped_convfunc,
     }
 };
 
@@ -134,13 +204,72 @@ const struct PrinterSegment sg __attribute__((used, section(".text"))) = {
 static HPDF_Doc            g_doc;        /* current PDF document   */
 static struct IORequest   *g_req;        /* current IORequest      */
 static int                 g_npages;     /* pages in current doc   */
-static struct Library     *g_jfifBase;   /* jfif.library base      */
 
 /* Per-page band accumulation (Render path) */
 static UBYTE              *g_rowbuf;     /* accumulated RGB24 rows */
 static ULONG               g_rowbufsz;   /* allocated bytes        */
 static ULONG               g_rowstride;  /* bytes per row (w * 3)  */
 static ULONG               g_nrows;      /* rows accumulated so far*/
+
+/* Text-mode accumulation (ped_ConvFunc path) */
+#define TP_MAXLINES  256                 /* max lines per text page  */
+#define TP_MAXCOL    256                 /* chars per line           */
+#define TP_PAGE_W    612.0f              /* default (US Letter, pt)  */
+#define TP_PAGE_H    792.0f
+#define TP_MARGIN     36.0f
+#define TP_FONTSIZE   10.0f
+#define TP_LINESTEP   12.0f              /* 6 lines per inch         */
+
+#define TP_ST_NORMAL     0x00
+#define TP_ST_BOLD       0x01
+#define TP_ST_ITALIC     0x02
+#define TP_ST_UNDERLINE  0x04
+
+struct TCell {
+    char  ch;                            /* character code         */
+    UBYTE st;                            /* TP_ST_* attributes     */
+    UBYTE lk;                            /* link id (0 = none)     */
+};
+
+static struct TCell  g_txt[TP_MAXLINES][TP_MAXCOL];
+static int           g_txtlen[TP_MAXLINES]; /* chars per stored line */
+static int           g_txtsln;              /* current line index    */
+static int           g_txtcol;              /* current column count  */
+static int           g_txtactive;          /* any text this page     */
+static int           g_txtcr;               /* CR pending (CRLF pair) */
+static UBYTE         g_txtstyle;            /* current TP_ST_* attrs  */
+
+/* Hyperlinks: OSC-8 regions (explicit) and auto-detected URLs are
+ * emitted as PDF URI link annotations. */
+#define TP_MAXLINKS  64                  /* links per text page     */
+#define TP_LINKLEN   256                 /* max OSC-8 URI length    */
+
+#define OSC_IDLE     0                   /* osc-8 parser states     */
+#define OSC_ESC      1
+#define OSC_CMD      2                   /* expecting "8"            */
+#define OSC_P1       3                   /* between 1st/2nd ';'      */
+#define OSC_URI      4                   /* collecting URI           */
+#define OSC_ESCEND   5                   /* seen ESC while in URI    */
+#define OSC_CSI      6                   /* ANSI CSI parameter       */
+
+#define TP_CSIMAX    32                  /* max CSI parameter string */
+
+static char  *g_links[TP_MAXLINKS];      /* pool of link URIs        */
+static int    g_nlinks;                  /* entries in g_links       */
+static int    g_curlink;                 /* active link id (1..n)    */
+static int    g_osc;                     /* osc-8 parser state       */
+static char   g_oscuri[TP_LINKLEN];      /* osc-8 URI being read    */
+static int    g_osclen;
+static char   g_csibuf[TP_CSIMAX];       /* CSI parameter string     */
+static int    g_csil;
+
+/* Text-page geometry derived from Preferences (see pdf_page_setup) */
+static HPDF_REAL     g_page_w;             /* page size, points     */
+static HPDF_REAL     g_page_h;
+static HPDF_REAL     g_left;               /* text area margins     */
+static HPDF_REAL     g_right;
+static HPDF_REAL     g_line_step;          /* line pitch, points    */
+static int           g_max_lines;          /* lines before eject */
 
 /* ------------------------------------------------------------------
  *  PDF helpers
@@ -158,7 +287,7 @@ static int pdf_output(void)
     if (st != HPDF_OK) return -1;
 
     sz = HPDF_GetStreamSize(g_doc);
-    if (sz == 0) return 0;                  /* empty — nothing to do */
+    if (sz == 0) return 0;                  /* empty -- nothing to do */
 
     buf = AllocVec(sz, MEMF_ANY);
     if (!buf) return -1;
@@ -173,12 +302,10 @@ static int pdf_output(void)
     return (st == HPDF_OK) ? 0 : -1;
 }
 
-/* Add a JPEG buffer to the current PDF as a new page.
- *  w, h  – image dimensions in pixels
- *  jpeg  – pointer to JPEG-compressed data
- *  jsz   – size of JPEG data */
-static int pdf_add_jpeg(ULONG w, ULONG h,
-                        const HPDF_BYTE *jpeg, HPDF_UINT32 jsz)
+/* Add a raw RGB24 buffer to the current PDF as a new page.
+ *  w, h  - image dimensions in pixels
+ *  rgb   - RGB24 pixel data (top-down, w*h*3 bytes) */
+static int pdf_add_rgb(ULONG w, ULONG h, const HPDF_BYTE *rgb)
 {
     HPDF_Page  pg;
     HPDF_Image im;
@@ -186,7 +313,9 @@ static int pdf_add_jpeg(ULONG w, ULONG h,
 
     if (!g_doc) return -1;
 
-    im = HPDF_LoadJpegImageFromMem(g_doc, jpeg, jsz);
+    im = HPDF_LoadRawImageFromMem(g_doc, rgb,
+                                  (HPDF_UINT)w, (HPDF_UINT)h,
+                                  HPDF_CS_DEVICE_RGB, 8);
     if (!im) return -1;
 
     pg = HPDF_AddPage(g_doc);
@@ -202,72 +331,609 @@ static int pdf_add_jpeg(ULONG w, ULONG h,
     return 0;
 }
 
-/* Compress RGB24 data to JPEG in memory using -ljpeg (jpeg.library).
- *  *out     receives malloc'd buffer (caller must FreeVec)
- *  *outsz   receives size of the buffer
- * Returns 0 on success, -1 on failure. */
-static int rgb_to_jpeg(const UBYTE *rgb, int w, int h, int quality,
-                       HPDF_BYTE **out, HPDF_UINT32 *outsz)
-{
-    struct jpeg_compress_struct cinfo;
-    struct jpeg_error_mgr       jerr;
-    JSAMPROW                   row[1];
-    int                        y;
+/* ------------------------------------------------------------------
+ *  Text helpers -- accumulate style-tagged character cells into a
+ *  page-sized line array, emit text pages via libHaru.
+ * ------------------------------------------------------------------ */
 
-    cinfo.err = jpeg_std_error(&jerr);
-    jpeg_create_compress(&cinfo);
-    jpeg_mem_dest(&cinfo, out, (unsigned long *)outsz);
-    if (!*out) {
-        jpeg_destroy_compress(&cinfo);
+static int pdf_add_text(void);
+
+/* Map the current printer Preferences to the PDF text-page geometry:
+ * paper size, printable-area margins (chars * pitch width) and line
+ * pitch.  Everything in points; falls back to US Letter when the
+ * selected size is unknown. */
+static void pdf_page_setup(struct PrinterData *pd)
+{
+    static const struct {
+        UWORD    id;
+        HPDF_REAL w, h;
+    } sg_papers[] = {
+        { US_LETTER,  612.0f,   792.0f  },
+        { US_LEGAL,   612.0f,   1008.0f },
+        { N_TRACTOR,  684.0f,   792.0f  },
+        { W_TRACTOR,  1070.0f,  792.0f  },
+        { EURO_A0,    2384.0f,  3370.0f },
+        { EURO_A1,    1684.0f,  2384.0f },
+        { EURO_A2,    1191.0f,  1684.0f },
+        { EURO_A3,    842.0f,   1191.0f },
+        { EURO_A4,    595.0f,   842.0f  },
+        { EURO_A5,    420.0f,   595.0f  },
+        { EURO_A6,    298.0f,   420.0f  },
+        { EURO_A7,    210.0f,   298.0f  },
+        { EURO_A8,    148.0f,   210.0f  },
+        { 0,          0.0f,     0.0f    }
+    };
+    struct Preferences *pr;
+    HPDF_REAL          cw;
+    int                i;
+
+    g_page_w    = TP_PAGE_W;
+    g_page_h    = TP_PAGE_H;
+    g_left      = TP_MARGIN;
+    g_right     = TP_PAGE_W - TP_MARGIN;
+    g_line_step = TP_LINESTEP;
+    g_max_lines = TP_MAXLINES;
+
+    pr = &pd->pd_Preferences;
+
+    for (i = 0; i < (int)(sizeof sg_papers / sizeof sg_papers[0]) - 1; i++) {
+        if (sg_papers[i].id == pr->PaperSize) {
+            g_page_w = sg_papers[i].w;
+            g_page_h = sg_papers[i].h;
+            break;
+        }
+    }
+
+    switch (pr->PrintPitch & 0xC00) {     /* char width at pitch */
+    case ELITE: cw = 72.0f / 12.0f; break;
+    case FINE:  cw = 72.0f / 17.0f; break;
+    case PICA:
+    default:    cw = 72.0f / 10.0f; break;
+    }
+
+    g_left  = (HPDF_REAL)pr->PrintLeftMargin  * cw;
+    g_right = (HPDF_REAL)pr->PrintRightMargin * cw;
+
+    if (g_left  < 0)            g_left  = 0;             /* clamp */
+    if (g_left  > g_page_w / 2) g_left  = g_page_w / 2;
+    if (g_right < g_page_w / 2) g_right = g_page_w / 2;
+    if (g_right > g_page_w)     g_right = g_page_w;
+    if (g_right <= g_left)      g_right = g_left + g_page_w / 2;
+
+    if (pr->PrintSpacing == EIGHT_LPI)
+        g_line_step = 9.0f;               /* 8 lines per inch */
+
+    g_max_lines = (int)((g_page_h - 2 * TP_MARGIN) / g_line_step);
+    if (g_max_lines < 1)                    g_max_lines = 1;
+    if (g_max_lines > TP_MAXLINES)          g_max_lines = TP_MAXLINES;
+}
+
+static void text_reset(void)
+{
+    g_txtsln    = 0;
+    g_txtcol    = 0;
+    g_txtactive = 0;
+    g_txtcr     = 0;
+    g_txtstyle  = TP_ST_NORMAL;
+    g_osc       = OSC_IDLE;
+    g_osclen    = 0;
+    g_csil      = 0;
+}
+
+/* Pick the base-14 Helvetica variant for the given attributes. */
+static HPDF_Font text_font(HPDF_Doc doc, UBYTE st)
+{
+    const char *name = "Helvetica";
+
+    if (st & TP_ST_BOLD) {
+        name = (st & TP_ST_ITALIC) ? "Helvetica-BoldOblique"
+                                   : "Helvetica-Bold";
+    } else if (st & TP_ST_ITALIC) {
+        name = "Helvetica-Oblique";
+    }
+    return HPDF_GetFont(doc, name, NULL);
+}
+
+/* Lower-case ASCII (Latin-1 safe: only A-Z mapped). */
+static UBYTE text_low(UBYTE c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return (UBYTE)(c + 32);
+    return c;
+}
+
+/* Start of an OSC-8 link: [esc]8;p1;p2<st> opens a link, an empty
+ * [esc]8;;<st> closes the current one. */
+static void link_finish(void)
+{
+    char *blk;
+
+    if (g_osclen == 0) {                  /* empty URI -> close */
+        g_curlink = 0;
+        return;
+    }
+    g_oscuri[g_osclen] = '\0';
+    if (g_nlinks >= TP_MAXLINKS) {
+        g_curlink = 0;
+        return;
+    }
+
+    blk = AllocVec(g_osclen + 1, MEMF_ANY);
+    if (!blk) {
+        g_curlink = 0;
+        return;
+    }
+    memcpy(blk, g_oscuri, g_osclen + 1);
+    g_links[g_nlinks] = blk;
+    g_curlink = g_nlinks + 1;
+    g_nlinks++;
+}
+
+static void link_pool_free(void)
+{
+    int k;
+
+    for (k = 0; k < g_nlinks; k++)
+        if (g_links[k]) FreeVec(g_links[k]);
+    g_nlinks = 0;
+}
+
+/* Auto-detect a URL at line offset s.  Returns the token length in
+ * cells (0 = no URL here).  Candidates are http/https/ftp:// and www.
+ * starting at a word boundary; the token ends at whitespace, an
+ * explicit link, or a bracket/quote character, with trailing sentence
+ * punctuation trimmed. */
+static int text_url_end(int line, int len, int s)
+{
+    static const char *pfx[] = { "http://", "https://", "ftp://", "www." };
+    UBYTE              ch;
+    int                pi, k, e;
+
+    if (s > 0 && s < len) {               /* must follow a boundary   */
+        ch = (UBYTE)g_txt[line][s - 1].ch;
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '#' || ch == '_' || ch == '-')
+            return 0;
+    }
+
+    for (pi = 0; pi < 4; pi++) {
+        k = 0;
+        while (pfx[pi][k] && s + k < len &&
+               text_low((UBYTE)g_txt[line][s + k].ch) == (UBYTE)pfx[pi][k])
+            k++;
+        if (pfx[pi][k] == '\0')
+            break;
+    }
+    if (pi == 4)
+        return 0;
+
+    e = s + (int)strlen(pfx[pi]);
+    while (e < len) {
+        ch = (UBYTE)g_txt[line][e].ch;
+        if (g_txt[line][e].lk)            /* explicit link interrupts */
+            break;
+        if (ch <= ' ')                    /* whitespace ends token    */
+            break;
+        if (ch == '"' || ch == '\'' || ch == '<' || ch == '>' ||
+            ch == '{' || ch == '}' || ch == '[' || ch == ']' ||
+            ch == '(' || ch == ')' || ch == '|' || ch == '`')
+            break;
+        e++;
+    }
+    while (e - 1 > s &&                      /* trim trailing punct   */
+           (g_txt[line][e - 1].ch == '.' || g_txt[line][e - 1].ch == ',' ||
+            g_txt[line][e - 1].ch == ';' || g_txt[line][e - 1].ch == ':' ||
+            g_txt[line][e - 1].ch == '!' || g_txt[line][e - 1].ch == '?' ||
+            g_txt[line][e - 1].ch == '\'' || g_txt[line][e - 1].ch == '"'))
+        e--;
+
+    return (e - s > 5) ? e - s : 0;
+}
+
+/* Emit the accumulated lines as PDF text pages, splitting each line
+ * into runs that share style + explicit link id.  Auto-detected URLs
+ * (cells with no explicit link) and OSC-8 regions become URI link
+ * annotations. */
+static int pdf_add_text(void)
+{
+    HPDF_Page      pg;
+    HPDF_REAL      y, x, w, asc, desc;
+    HPDF_REAL      cumx[TP_MAXCOL];
+    HPDF_Font      fnt;
+    HPDF_BYTE      cbuf;
+    char           runbuf[TP_MAXCOL + 1];
+    char           uri[TP_MAXCOL + 1];
+    int            i, j, n, len, s, k, is_url;
+
+    if (!g_doc) {
+        link_pool_free();
+        return 0;
+    }
+    if (!g_txtactive) {
+        if (g_curlink) {                  /* dangling open link       */
+            link_pool_free();
+            g_curlink = 0;
+        }
+        return 0;
+    }
+
+    pg = HPDF_AddPage(g_doc);
+    if (!pg) {
+        link_pool_free();
         return -1;
     }
+    HPDF_Page_SetWidth(pg, g_page_w);
+    HPDF_Page_SetHeight(pg, g_page_h);
 
-    cinfo.image_width      = w;
-    cinfo.image_height     = h;
-    cinfo.input_components = 3;
-    cinfo.in_color_space   = JCS_RGB;
+    y = g_page_h - TP_MARGIN;
+    for (i = 0; i < g_txtsln && y > TP_MARGIN; i++, y -= g_line_step) {
+        len = g_txtlen[i];
+        if (len <= 0) continue;
 
-    jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, quality, TRUE);
-    jpeg_start_compress(&cinfo, TRUE);
+        /* Measure per-cell advances so link rects match the glyphs. */
+        x = g_left;
+        for (j = 0; j < len; j++) {
+            cumx[j] = x;
+            cbuf    = (HPDF_BYTE)(UBYTE)g_txt[i][j].ch;
+            fnt     = text_font(g_doc, g_txt[i][j].st);
+            if (!fnt) continue;
+            x += (HPDF_REAL)HPDF_Font_TextWidth(fnt, &cbuf, 1).width *
+                 TP_FONTSIZE / 1000.0f;
+        }
+        cumx[len] = x;                    /* right edge incl. last cell */
 
-    while (cinfo.next_scanline < (JDIMENSION)h) {
-        row[0] = (JSAMPROW)(rgb + cinfo.next_scanline * w * 3);
-        jpeg_write_scanlines(&cinfo, row, 1);
+        /* Draw runs (split on style OR explicit link). */
+        j = 0;
+        while (j < len && cumx[j] < g_right) {
+            UBYTE st = g_txt[i][j].st;
+            UBYTE lk = g_txt[i][j].lk;
+
+            n = 0;
+            while (j + n < len && g_txt[i][j + n].st == st &&
+                   g_txt[i][j + n].lk == lk) {
+                runbuf[n] = g_txt[i][j + n].ch;
+                n++;
+            }
+            runbuf[n] = '\0';
+
+            fnt = text_font(g_doc, st);
+            if (fnt) {
+                HPDF_Page_BeginText(pg);
+                HPDF_Page_SetFontAndSize(pg, fnt, TP_FONTSIZE);
+                HPDF_Page_MoveTextPos(pg, cumx[j], y);
+                HPDF_Page_ShowText(pg, runbuf);
+                HPDF_Page_EndText(pg);
+
+                if (st & TP_ST_UNDERLINE) {
+                    HPDF_Page_SetLineWidth(pg, 0.5f);
+                    HPDF_Page_MoveTo(pg, cumx[j], y - 1.5f);
+                    HPDF_Page_LineTo(pg, cumx[j + n], y - 1.5f);
+                    HPDF_Page_Stroke(pg);
+                }
+            }
+
+            /* Explicit OSC-8 region: one URI annotation per run. */
+            if (lk && lk <= g_nlinks && fnt) {
+                HPDF_Rect r;
+
+                asc  = (HPDF_REAL)HPDF_Font_GetAscent(fnt)  * TP_FONTSIZE / 1000.0f;
+                desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) * TP_FONTSIZE / 1000.0f;
+                if (cumx[j + n] > g_right) cumx[j + n] = g_right;
+                r.left   = cumx[j];
+                r.bottom = y - desc;
+                r.right  = cumx[j + n];
+                r.top    = y + asc;
+                HPDF_Page_CreateURILinkAnnot(pg, r, g_links[lk - 1]);
+            }
+
+            j += n;
+        }
+
+        /* Auto-detect URLs on unlinked cells. */
+        s = 0;
+        while (s < len && cumx[s] < g_right) {
+            if (g_txt[i][s].lk) {
+                s++;
+                continue;
+            }
+            is_url = 0;
+            if ((k = text_url_end(i, len, s)) > 5) {
+                for (int q = 0; q < k; q++)
+                    uri[q] = g_txt[i][s + q].ch;
+                uri[k] = '\0';
+                is_url = 1;
+            }
+            if (is_url) {
+                fnt = text_font(g_doc, g_txt[i][s].st);
+                if (fnt) {
+                    HPDF_Rect r;
+
+                    asc  = (HPDF_REAL)HPDF_Font_GetAscent(fnt)  * TP_FONTSIZE / 1000.0f;
+                    desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) * TP_FONTSIZE / 1000.0f;
+                    x = cumx[s];
+                    w = cumx[s + k];
+                    if (w > g_right) w = g_right;
+                    r.left   = x;
+                    r.bottom = y - desc;
+                    r.right  = w;
+                    r.top    = y + asc;
+                    HPDF_Page_CreateURILinkAnnot(pg, r, uri);
+                }
+                s += k;
+            } else {
+                s++;
+            }
+        }
     }
 
-    jpeg_finish_compress(&cinfo);
-    jpeg_destroy_compress(&cinfo);
+    g_npages++;
+
+    /* Page-scoped link pool: an OSC-8 link still open carries over to
+     * the next text page so regions spanning a formfeed survive. */
+    if (g_curlink && g_links[g_curlink - 1]) {
+        char *keep = g_links[g_curlink - 1];
+        link_pool_free();
+        g_links[0] = keep;
+        g_nlinks   = 1;
+        g_curlink  = 1;
+    } else {
+        link_pool_free();
+        g_curlink = 0;
+    }
     return 0;
+}
+
+static void text_newline(void)
+{
+    if (g_txtsln >= g_max_lines) {        /* page capacity -> eject  */
+        pdf_add_text();
+        text_reset();
+    }
+    g_txtlen[g_txtsln] = g_txtcol;
+    g_txtsln++;
+    g_txtcol = 0;
+    g_txtactive = 1;
+}
+
+static int text_char(UBYTE c)
+{
+    switch (c) {
+
+    case '\014':                           /* formfeed: eject page   */
+        pdf_add_text();
+        text_reset();
+        return 1;
+
+    case '\r':                             /* CR                     */
+        g_txtcr = 1;
+        text_newline();
+        return 1;
+
+    case '\n':                             /* LF (ignore after CR)   */
+        if (g_txtcr) {
+            g_txtcr = 0;
+            return 1;
+        }
+        text_newline();
+        return 1;
+
+    case '\t':                             /* expand to next tab stop */
+        g_txtactive = 1;
+        do {
+            if (g_txtcol >= TP_MAXCOL - 1) break;
+            g_txt[g_txtsln][g_txtcol].ch = ' ';
+            g_txt[g_txtsln][g_txtcol].st = g_txtstyle;
+            g_txt[g_txtsln][g_txtcol].lk = g_curlink;
+            g_txtcol++;
+        } while (g_txtcol % 8);
+        return 1;
+
+    default:
+        if (c < 0x20)                      /* swallow other controls */
+            return 1;
+        if (g_txtcol < TP_MAXCOL - 1) {
+            g_txt[g_txtsln][g_txtcol].ch = (char)c;
+            g_txt[g_txtsln][g_txtcol].st = g_txtstyle;
+            g_txt[g_txtsln][g_txtcol].lk = g_curlink;
+            g_txtcol++;
+            g_txtactive = 1;
+        }
+        return 1;
+    }
+}
+
+/* Flush any pending text page (e.g. on device close). */
+static void text_flush(void)
+{
+    pdf_add_text();
+    text_reset();
+}
+
+/* Apply one SGR/ANSI style command code (aSGR0..aSGR24 / aRIS).
+ * Shared by ped_DoSpecial (7-bit commands from printer.device) and the
+ * 8-bit CSI parser in ped_convfunc. */
+static void style_set(UBYTE code)
+{
+    switch (code) {
+    case aRIS:
+    case aSGR0:                          /* attributes off */
+        g_txtstyle = TP_ST_NORMAL;
+        break;
+    case aSGR1:                          /* bold */
+        g_txtstyle |= TP_ST_BOLD;
+        break;
+    case aSGR22:                         /* normal intensity */
+        g_txtstyle &= ~TP_ST_BOLD;
+        break;
+    case aSGR3:                          /* italic */
+        g_txtstyle |= TP_ST_ITALIC;
+        break;
+    case aSGR23:                         /* italic off */
+        g_txtstyle &= ~TP_ST_ITALIC;
+        break;
+    case aSGR4:                          /* underline */
+        g_txtstyle |= TP_ST_UNDERLINE;
+        break;
+    case aSGR24:                         /* underline off */
+        g_txtstyle &= ~TP_ST_UNDERLINE;
+        break;
+    default:
+        break;
+    }
 }
 
 /* ------------------------------------------------------------------
  *  Driver entry points
  * ------------------------------------------------------------------ */
 
+static int ped_convfunc(UBYTE *buf, UBYTE c, LONG crlf_flag)
+{
+    (void)buf;
+    (void)crlf_flag;
+
+    switch (g_osc) {
+
+    case OSC_IDLE:
+        if (c == 0x1B) {                  /* ESC -> 7-bit CSI/OSC  */
+            g_osc = OSC_ESC;
+            g_osclen = 0;
+            return 0;
+        }
+        if (c == 0x9B) {                  /* 8-bit CSI (ECMA-48)    */
+            g_osc = OSC_CSI;
+            g_csil = 0;
+            return 0;
+        }
+        if (c == 0x9D) {                  /* 8-bit OSC              */
+            g_osc = OSC_CMD;
+            g_osclen = 0;
+            return 0;
+        }
+        if (c == 0x9C)                    /* 8-bit ST: ignore       */
+            return 0;
+        g_osclen = 0;
+        text_char(c);
+        return 0;                         /* handled: nothing to emit */
+
+    case OSC_ESC:                         /* expecting '[' or ']'    */
+        if (c == '[') {
+            g_osc = OSC_CSI;
+            g_csil = 0;
+        } else if (c == ']') {
+            g_osc = OSC_CMD;
+        } else {
+            g_osc = OSC_IDLE;             /* unknown escape: drop   */
+        }
+        return 0;
+
+    case OSC_CMD:                         /* expecting "8"            */
+        if (c == ';')
+            g_osc = OSC_P1;
+        else if (c < '0' || c > '9')
+            g_osc = OSC_IDLE;         /* not OSC-8: drop          */
+        /* digits keep us in OSC_CMD */
+        return 0;
+
+    case OSC_P1:                          /* skip id param until ';'  */
+        if (c == ';') {
+            g_osc = OSC_URI;
+            g_osclen = 0;
+        } else if (c == 0x07 || c == 0x9C) {
+            g_osc = OSC_IDLE;             /* empty OSC: ignore        */
+        } else if (c == 0x1B) {
+            g_osc = OSC_ESCEND;
+        }
+        return 0;
+
+    case OSC_URI:                         /* collecting URI           */
+        if (c == 0x07 || c == 0x9C) {     /* BEL / 8-bit ST          */
+            link_finish();
+            g_osc = OSC_IDLE;
+        } else if (c == 0x1B) {           /* ESC... ST terminates     */
+            g_osc = OSC_ESCEND;
+        } else if (g_osclen < TP_LINKLEN - 1) {
+            g_oscuri[g_osclen++] = (char)c;
+        }
+        return 0;
+
+    case OSC_ESCEND:                      /* expect '\' (ST)          */
+        if (c == '\\')
+            link_finish();
+        g_osc = OSC_IDLE;
+        return 0;
+
+    case OSC_CSI:                         /* ANSI CSI parameters      */
+        if ((c >= '0' && c <= '9') || c == ';' || c == ':') {
+            if (g_csil < TP_CSIMAX - 1)
+                g_csibuf[g_csil++] = (char)c;
+            return 0;
+        }
+        if (c == 'm') {                   /* SGR applies styles      */
+            int val, any;
+            char *p;
+
+            g_csibuf[g_csil] = '\0';
+            p   = g_csibuf;
+            val = 0;
+            any = 0;
+            for (;;) {
+                if (*p >= '0' && *p <= '9') {
+                    val = val * 10 + (*p - '0');
+                    any = 1;
+                } else if (*p == ';' || *p == '\0') {
+                    if (any) {
+                        switch (val) {    /* SGR number -> aSGR code  */
+                        case 0:  style_set(aSGR0);  break;
+                        case 1:  style_set(aSGR1);  break;
+                        case 3:  style_set(aSGR3);  break;
+                        case 4:  style_set(aSGR4);  break;
+                        case 22: style_set(aSGR22); break;
+                        case 23: style_set(aSGR23); break;
+                        case 24: style_set(aSGR24); break;
+                        default: break;   /* unsupported SGR: ignore */
+                        }
+                        val = 0;
+                        any = 0;
+                    }
+                    if (*p == '\0')
+                        break;
+                }
+                p++;
+            }
+        }
+        g_osc = OSC_IDLE;
+        return 0;
+
+    default:
+        g_osc = OSC_IDLE;
+        return 0;
+    }
+}
+
+static struct PrinterData *g_pd;          /* current PrinterData  */
+
 static int ped_init(struct PrinterData *pd)
 {
-    (void)pd;
+    g_pd       = pd;
     g_doc      = NULL;
     g_req      = NULL;
     g_npages   = 0;
-    g_jfifBase = OpenLibrary("jfif.library", 0);
+    pdf_page_setup(pd);
+    text_reset();
     return 0;
 }
 
 static void ped_expunge(void)
 {
     if (g_doc) {
+        text_flush();
         if (g_npages > 0) pdf_output();
         HPDF_FreeDocAll(g_doc);
     }
-    if (g_jfifBase) {
-        CloseLibrary(g_jfifBase);
-        g_jfifBase = NULL;
-    }
-    g_doc    = NULL;
-    g_req    = NULL;
-    g_npages = 0;
+    g_doc      = NULL;
+    g_req      = NULL;
+    g_npages   = 0;
+    text_reset();
 }
 
 static int ped_open(struct IORequest *ior)
@@ -277,7 +943,9 @@ static int ped_open(struct IORequest *ior)
     g_doc = HPDF_New(NULL, NULL);
     if (!g_doc) return -1;
 
-    g_npages = 0;
+    if (g_pd) pdf_page_setup(g_pd);       /* device may have re-prefs */
+    g_npages   = 0;
+    text_reset();
     return 0;
 }
 
@@ -285,12 +953,14 @@ static void ped_close(struct IORequest *ior)
 {
     (void)ior;
     if (g_doc) {
+        text_flush();
         if (g_npages > 0) pdf_output();
         HPDF_FreeDocAll(g_doc);
     }
-    g_doc    = NULL;
-    g_req    = NULL;
-    g_npages = 0;
+    g_doc      = NULL;
+    g_req      = NULL;
+    g_npages   = 0;
+    text_reset();
 }
 
 /*
@@ -333,23 +1003,59 @@ struct PrinterIORP {
 } __attribute__((packed));
 
 /* ------------------------------------------------------------------
- *  DoSpecial — handles the TurboPrint data path
+ *  DoSpecial -- dual entry point, two incompatible call shapes
  *
- *  PRD_TPEXTDUMPRPORT  receives a TPExtIODRP (pointer via io_Modes)
- *  and the raster bitmap via io_RastPort.  We read the pixel data
- *  (TPFMT_RGB24 and similar), compress to JPEG and embed in the PDF.
+ *  printer.device invokes this in one of two ways:
+ *
+ *  1. Text form (OS-standard, via a \377 in a Commands[] entry):
+ *       LONG fn(UWORD *command, UBYTE *out, BYTE *vline, BYTE *vmi,
+ *               BYTE *crlf, UBYTE *params);
+ *     command is an ANSI code aSGR0..aSGR24 used here for font styles.
+ *  2. TurboPrint IORP form (via PRD_TPEXTDUMPRPORT):
+ *       LONG fn(struct IORequest *ior);
+ *     ior carries the TPExtIODRP (ptr via io_Modes) + RastPort bitmap.
+ *
+ *  Dispatch heuristic: the text form always passes a command code
+ *  <= aRAW (76); the IORP form passes a pointer whose first word is the
+ *  list successor (a memory address, virtually always > 76).  A zero
+ *  ln_Succ decodes to aRIS (0), which merely resets the font style --
+ *  benign for the worst case.
  * ------------------------------------------------------------------ */
 
-static int ped_dospecial(struct IORequest *ior)
+static LONG dospecial_iorp(struct IORequest *ior);
+
+static LONG ped_dospecial(UWORD *command, UBYTE *out,
+                          BYTE *pl_curline, BYTE *pl_spacing,
+                          BYTE *pl_crlf, UBYTE *params)
+{
+    UWORD code = *command;
+
+    (void)out;
+    (void)pl_curline;
+    (void)pl_spacing;
+    (void)pl_crlf;
+    (void)params;
+
+    if (code <= aRAW) {
+        style_set((UBYTE)code);           /* SGR attribute command   */
+        return -2;                        /* handled: emit nothing   */
+    }
+
+    return dospecial_iorp((struct IORequest *)command);
+}
+
+/* TurboPrint IORP path: PRD_TPEXTDUMPRPORT carries a TPExtIODRP
+ * (pointer via io_Modes) + RastPort bitmap; read RGB24 and embed via
+ * libHaru. */
+static LONG dospecial_iorp(struct IORequest *ior)
 {
     struct PrinterIORP   *req;
     struct TPExtIODRP    *tp;
     struct RastPort      *rp;
     struct BitMap        *bm;
     UBYTE                *rgb;
-    HPDF_BYTE            *jpeg;
-    HPDF_UINT32           jsz;
     ULONG                 w, h, stride, y;
+    int                   st;
 
     if (ior->io_Command != PRD_TPEXTDUMPRPORT)
         return -1;
@@ -357,7 +1063,6 @@ static int ped_dospecial(struct IORequest *ior)
     req = (struct PrinterIORP *)ior;
     tp  = (struct TPExtIODRP *)req->io_Modes;
     if (!tp) return -1;
-    if (!g_jfifBase) return -1;
 
     rp = (struct RastPort *)req->io_RastPort;
     if (!rp || !rp->BitMap) return -1;
@@ -378,31 +1083,26 @@ static int ped_dospecial(struct IORequest *ior)
      * FIXME: planar conversion needed for classic Amiga. */
     if (bm->Depth == 1 && bm->Planes[0]) {
         for (y = 0; y < h; y++)
-            CopyMem((UBYTE *)bm->Planes[0] + y * stride,
-                    rgb + y * w * 3,
-                    w * 3);
+            memcpy(rgb + y * w * 3,
+                   (UBYTE *)bm->Planes[0] + y * stride,
+                   w * 3);
     } else {
-        SetMem(rgb, 0x80, w * h * 3);
+        memset(rgb, 0x80, w * h * 3);
     }
 
-    /* Compress to JPEG and embed as a new PDF page */
-    jpeg = NULL;
-    jsz  = 0;
-
-    if (rgb_to_jpeg(rgb, w, h, 90, &jpeg, &jsz) == 0 && jpeg) {
-        pdf_add_jpeg(w, h, jpeg, jsz);
-        FreeVec(jpeg);
-    }
+    /* Embed as a new PDF page via libHaru */
+    st = pdf_add_rgb(w, h, rgb);
 
     FreeVec(rgb);
-    return (jpeg != NULL) ? 0 : -1;
+    return st;
 }
 
 /* ------------------------------------------------------------------
- *  Render — standard raster data path
+ *  Render -- standard raster data path
  *
  *  Called by printer.device for PRD_DUMPRPORT.
- *  We receive raster data via the RastPort and convert it to JPEG.
+ *  We receive raster data via the RastPort, accumulate RGB24 rows and
+ *  embed each band in the PDF via libHaru.
  * ------------------------------------------------------------------ */
 
 static int ped_render(struct RastPort *rp,
@@ -411,15 +1111,13 @@ static int ped_render(struct RastPort *rp,
     struct BitMap  *bm;
     ULONG           stride, band_h, need;
     UBYTE          *src, *dst;
-    HPDF_BYTE      *jpeg;
-    HPDF_UINT32     jsz;
 
     (void)x;
     (void)status;
 
     switch (c) {
 
-    /* pre-master init — reset band accumulation */
+    /* pre-master init -- reset band accumulation */
     case 0:
         g_rowbuf   = NULL;
         g_rowbufsz = 0;
@@ -427,7 +1125,7 @@ static int ped_render(struct RastPort *rp,
         g_nrows    = 0;
         return 0;
 
-    /* scale, dither & render — accumulate one band */
+    /* scale, dither & render -- accumulate one band */
     case 1: {
         if (!rp || !rp->BitMap)
             return -1;
@@ -445,7 +1143,7 @@ static int ped_render(struct RastPort *rp,
             UBYTE *nb = AllocVec(need, MEMF_ANY);
             if (!nb) return -1;
             if (g_rowbuf) {
-                CopyMem(g_rowbuf, nb, g_rowbufsz);
+                memcpy(nb, g_rowbuf, g_rowbufsz);
                 FreeVec(g_rowbuf);
             }
             g_rowbuf   = nb;
@@ -456,25 +1154,25 @@ static int ped_render(struct RastPort *rp,
         dst = g_rowbuf + g_nrows * stride;
 
         /* Read pixel data from the bitmap.
-         * One plane → chunky (CGX/MorphOS).  Multiple planes → planar
+         * One plane -> chunky (CGX/MorphOS).  Multiple planes -> planar
          * (classic Amiga).  For now handle chunky; planar is stubbed. */
         if (bm->Depth == 1) {
-            /* Chunky — pixel data lives in Planes[0] */
+            /* Chunky -- pixel data lives in Planes[0] */
             src = bm->Planes[0];
             if (src)
-                CopyMem(src + g_nrows * stride, dst, stride * band_h);
+                memcpy(dst, src + g_nrows * stride, stride * band_h);
             else
-                SetMem(dst, 0x80, stride * band_h);
+                memset(dst, 0x80, stride * band_h);
         } else {
-            /* Planar — FIXME: implement proper planar→RGB conversion */
-            SetMem(dst, 0x80, stride * band_h);
+            /* Planar -- FIXME: implement proper planar->RGB conversion */
+            memset(dst, 0x80, stride * band_h);
         }
 
         g_nrows += band_h;
         return 0;
     }
 
-    /* output buffer — compress accumulated rows to JPEG, add to PDF */
+    /* output buffer -- embed accumulated rows as a new PDF page */
     case 2: {
         ULONG w, h;
         if (!g_rowbuf || g_nrows == 0 || g_rowstride == 0)
@@ -483,12 +1181,13 @@ static int ped_render(struct RastPort *rp,
         w = g_rowstride / 3;                 /* pixels per row */
         h = g_nrows;                         /* total rows     */
 
-        jpeg = NULL;
-        jsz  = 0;
-
-        if (rgb_to_jpeg(g_rowbuf, w, h, 90, &jpeg, &jsz) == 0 && jpeg) {
-            pdf_add_jpeg(w, h, jpeg, jsz);
-            FreeVec(jpeg);
+        if (pdf_add_rgb(w, h, g_rowbuf) != 0) {
+            FreeVec(g_rowbuf);
+            g_rowbuf   = NULL;
+            g_rowbufsz = 0;
+            g_rowstride = 0;
+            g_nrows    = 0;
+            return -1;
         }
 
         FreeVec(g_rowbuf);

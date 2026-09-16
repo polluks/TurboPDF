@@ -17,6 +17,7 @@ Files
 | `tpd.c` | PrinterSegment driver — pure C, no assembly |
 | `turboprint.h` | TurboPrint pixel format constants + `TPExtIODRP` struct |
 | `Makefile` | Build system for ppc-morphos-gcc |
+| `external/libharu` | libHaru git submodule, built statically into the driver |
 
 ---
 
@@ -31,18 +32,55 @@ containing a `PrinterExtendedData` (PED) which exposes entry points:
 
   `Init`, `Expunge`, `Open`, `Close`, `DoSpecial`, `Render`
 
-Two data paths:
+Three data paths:
+
+  **Text path** (text mode → `ped_ConvFunc`)
+    printer.device delivers printable characters to the driver's
+    `ped_ConvFunc` (requires driver version ≥ 34).  Lines accumulate and
+    are emitted as PDF pages via libHaru.  Page geometry is taken from
+    the driver's copy of the user's Preferences (`pd_Preferences`):
+    the selected paper size (US Letter, A4/A5/A3..A0, Legal, tractor
+    feed) maps to PDF page dimensions in points, the left/right margins
+    (in characters × pitch) define the printable area, and the spacing
+    selection sets the line pitch (6 or 8 lines/inch).  Unknown sizes
+    fall back to US Letter.
+    `\n`/`\r` start a new line, tab expansion is to 8-column stops, and
+    `\014` (formfeed) ejects a page.
+    ANSI SGR sequences are recognized through the Commands table entries
+    that contain `\377`, which route to `DoSpecial` in its text form:
+    `aSGR0` resets, `aSGR1`/`aSGR22` toggle bold, `aSGR3`/`aSGR23` toggle
+    italic, `aSGR4`/`aSGR24` toggle underline (per-character styles).
+    The base-14 Helvetica family is used: Helvetica, Helvetica-Bold,
+    Helvetica-Oblique, Helvetica-BoldOblique; underlined runs get a
+    stroked rule.
+
+    **Hyperlinks** — text URLs become clickable PDF links:
+      * Auto-detection: `http://`, `https://`, `ftp://` and `www.`
+        tokens in the printed text get a URI link annotation matching
+        the rendered glyphs (trailing sentence punctuation trimmed).
+      * OSC 8 (terminal hyperlinks): an explicit link is opened and
+        closed in the character stream with
+        `ESC ] 8 ; <id> ; <uri> BEL` (or `ESC ] 8 ; ; <uri> ESC \ `) and
+        closed with an empty URI.  The region gets a URI link
+        annotation with the given URI.  An open link also survives a
+        formfeed so multi-line hyperlinks keep working.  `ESC]` is not
+        a standard printer escape, so printer.device passes the sequence
+        through unmodified for the driver's `ped_ConvFunc` to consume
+        (it never appears on the printed page).
+      * 8-bit ECMA-48 forms are recognised as well: CSI `0x9B` and OSC
+        `0x9D`, terminated by ST `0x9C` (BEL for OSC).  `ped_ConvFunc`
+        parses `0x9B <params> m` with the same SGR mapping as the table
+        commands (0,1,3,4,22,23,24 -> aSGR0..aSGR24) and routes `0x9D`
+        through the same OSC-8 parser as the 7-bit `ESC]` form.  Both
+        8-bit controls are dropped before they can reach the text.
 
   **TurboPrint path** (PRD_TPEXTDUMPRPORT → DoSpecial)
-    The application sends pre-compressed JPEG data in a `TPExtIODRP`
-    struct.  The driver embeds the JPEG directly into the PDF document
-    via `HPDF_LoadJpegImageFromMem`.
+    The driver reads the raster bitmap passed in the `TPExtIODRP`
+    request and embeds it as a raw RGB image via `HPDF_LoadRawImageFromMem`.
 
   **Standard path** (PRD_DUMPRPORT → Render)
-    The application sends a RastPort with raster data.  The driver
-    converts the bitmap to RGB24, compresses it to JPEG using the
-    libjpeg API (via `-ljfif`, wrapping `jfif.library`), then embeds
-    it in the PDF.
+    The driver converts the RastPort bitmap to RGB24, accumulates it
+    across bands and embeds each band as a raw RGB image via libHaru.
 
 Output
   PDF is written to stdout (via dos.library `Output()`/`Write()`) when
@@ -53,11 +91,12 @@ Supported driver entry points
 
 | Entry | Description |
 |-------|-------------|
-| Init | Save PrinterData pointer; reset PDF state |
+| Init | Save PrinterData pointer; reset PDF + text state |
 | Open | Create new HPDF document |
-| Close | Flush PDF to stdout; free HPDF document |
+| Close | Flush final text page + PDF to stdout; free HPDF document |
 | Expunge | Emergency cleanup if Close wasn't called |
-| DoSpecial | Handle PRD_TPEXTDUMPRPORT (TurboPrint JPEG data) |
+| ConvFunc | Text-mode: accumulate characters and emit PDF text pages |
+| DoSpecial | \377 text-command form: toggle bold/italic/underline styles. IORP form: handle PRD_TPEXTDUMPRPORT (TurboPrint bitmap data). Dispatch is by first word ≤ aRAW (text) vs. a pointer (IORP) |
 | Render | Handle PRD_DUMPRPORT (standard RastPort raster data) |
 
 Struct packing
@@ -69,15 +108,27 @@ Struct packing
 Build
   ```
   make            # release build → build-release/TurboPDF.tpd
+                  #   libHaru built statically from the bundled submodule
+  make static=0   # dynamic build — link against the system hpdf.library
   make debug=1    # debug build   → build-debug/TurboPDF.tpd
+  make check      # clean-builds static + dynamic, verifies output
+                  #   make check CHECK_MODES=static   (build one mode only)
   make clean
   ```
-  (requires `ppc-morphos-gcc`, MorphOS SDK with `hpdf.library` and `jfif.library`)
+  (requires `ppc-morphos-gcc`.  The static build pulls libHaru from the
+  `external/libharu` submodule, so no system `hpdf.library` is needed
+  there; the dynamic build requires the MorphOS SDK with `hpdf.library`.
+  All image and PDF output goes through libHaru — no jpeg/jfif dependency.)
+
+Pull submodule before building:
+  ```
+  git submodule update --init
+  ```
 
 Status
   Untested on real MorphOS hardware.  May need adjustments for
-  hpdf.library / jfif.library API compatibility, linker script
-  conventions, and bitmap conversion in the Render path.
+  hpdf.library API compatibility, linker script conventions, and
+  bitmap conversion in the Render path.
 
 ---
 
