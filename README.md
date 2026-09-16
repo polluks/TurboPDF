@@ -50,9 +50,23 @@ Three data paths:
     that contain `\377`, which route to `DoSpecial` in its text form:
     `aSGR0` resets, `aSGR1`/`aSGR22` toggle bold, `aSGR3`/`aSGR23` toggle
     italic, `aSGR4`/`aSGR24` toggle underline (per-character styles).
+    Colored runs arrive through the 8-bit CSI form (see below): `30-37` /
+    `40-47` and `90-97` / `100-107` select the ANSI foreground/background
+    palette, `38;5;n` / `48;5;n` select an xterm-256 colour, and
+    `38;2;r;g;b` / `48;2;r;g;b` set 24-bit RGB; `39`/`49` restore the
+    default.  Colors are shared with the styles: runs split on every
+    attribute, a coloured background is painted as a filled rectangle
+    behind the run, and underlined runs are stroked in the current
+    foreground color.
     The base-14 Helvetica family is used: Helvetica, Helvetica-Bold,
     Helvetica-Oblique, Helvetica-BoldOblique; underlined runs get a
-    stroked rule.
+    stroked rule.  The point size follows the selected pitch — PICA
+    10pt, ELITE 8.5pt, FINE 7pt — override the default with
+    `-DTP_FONTSIZE=<pt>` in the build.
+    Characters ≥ 0x80 are mapped through the driver's 8-bit character
+    table (`ped_8BitChars`, one set): C1 controls `0x80..0x9F` become
+    spaces and the Latin-1 range `0xA0..0xFF` keeps its glyph, so
+    accented text prints correctly.
 
     **Hyperlinks** — text URLs become clickable PDF links:
       * Auto-detection: `http://`, `https://`, `ftp://` and `www.`
@@ -70,9 +84,10 @@ Three data paths:
       * 8-bit ECMA-48 forms are recognised as well: CSI `0x9B` and OSC
         `0x9D`, terminated by ST `0x9C` (BEL for OSC).  `ped_ConvFunc`
         parses `0x9B <params> m` with the same SGR mapping as the table
-        commands (0,1,3,4,22,23,24 -> aSGR0..aSGR24) and routes `0x9D`
-        through the same OSC-8 parser as the 7-bit `ESC]` form.  Both
-        8-bit controls are dropped before they can reach the text.
+        commands (0,1,3,4,22,23,24 -> aSGR0..aSGR24) plus the full color
+        subset above, and routes `0x9D` through the same OSC-8 parser as
+        the 7-bit `ESC]` form.  Both 8-bit controls are dropped before
+        they can reach the text.
 
   **TurboPrint path** (PRD_TPEXTDUMPRPORT → DoSpecial)
     The driver reads the raster bitmap passed in the `TPExtIODRP`
@@ -168,3 +183,9 @@ TODO
 [ ] Test on real MorphOS hardware.
 [ ] Implement planar → RGB conversion in Render() for classic Amiga bitmaps.
 [ ] Investigate per-PrinterData state for concurrent printer instances.
+[ ] Top/bottom page margins: Preferences exposes no vertical-margin field
+    (top-of-form is fixed by the device), so a constant margin is used.
+[ ] Justification/centering: printer.device delivers text pre-formatted and
+    provides no alignment control channel, so text is always left-aligned.
+[ ] `pf_PrintColor` is not consulted — the color class is PPCF_COLOR and SGR
+    colors are always honoured.

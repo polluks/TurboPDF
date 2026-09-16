@@ -150,6 +150,21 @@ static void  style_set(UBYTE code);
 
 static const STRPTR sg_name  = "TurboPDF";
 
+/* 8-bit character set (ped_8BitChars / ped_NumCharSets): high bytes
+ * 0x80-0x9F (C1 controls) are not printable -- map to a space; the
+ * Latin-1 range 0xA0-0xFF keeps its glyph.  printer.device uses this
+ * table for codes >= 128; ped_convfunc applies the same mapping. */
+static const UBYTE sg_8bit[128] = {
+    ' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',
+    ' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',
+    0xA0,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,0xA8,0xA9,0xAA,0xAB,0xAC,0xAD,0xAE,0xAF,
+    0xB0,0xB1,0xB2,0xB3,0xB4,0xB5,0xB6,0xB7,0xB8,0xB9,0xBA,0xBB,0xBC,0xBD,0xBE,0xBF,
+    0xC0,0xC1,0xC2,0xC3,0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,0xCB,0xCC,0xCD,0xCE,0xCF,
+    0xD0,0xD1,0xD2,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,0xDB,0xDC,0xDD,0xDE,0xDF,
+    0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xEB,0xEC,0xED,0xEE,0xEF,
+    0xF0,0xF1,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF,
+};
+
 /* Printer escape-command table, indexed by ANSI command code aRIS(0) ..
  * aRAW(76).  The 0xFF entries route style changes (SGR) to ped_DoSpecial;
  * everything else stays NULL (ignored -- newline/formfeed handling lives
@@ -181,7 +196,7 @@ const struct PrinterSegment sg __attribute__((used, section(".text"))) = {
         .ped_PrinterClass = PPCF_GFX | PPCF_COLOR,
         .ped_ColorClass   = PCC_BW,
         .ped_MaxColumns   = 80,
-        .ped_NumCharSets  = 0,
+        .ped_NumCharSets  = 1,
         .ped_NumRows      = 1,
         .ped_MaxXDots     = 0,
         .ped_MaxYDots     = 0,
@@ -191,7 +206,7 @@ const struct PrinterSegment sg __attribute__((used, section(".text"))) = {
         .ped_DoSpecial    = ped_dospecial,
         .ped_Render       = ped_render,
         .ped_TimeoutSecs  = 120L,
-        .ped_8BitChars    = NULL,
+        .ped_8BitChars    = (APTR)sg_8bit,
         .ped_PrintMode    = 0,
         .ped_ConvFunc     = ped_convfunc,
     }
@@ -217,7 +232,9 @@ static ULONG               g_nrows;      /* rows accumulated so far*/
 #define TP_PAGE_W    612.0f              /* default (US Letter, pt)  */
 #define TP_PAGE_H    792.0f
 #define TP_MARGIN     36.0f
+#ifndef TP_FONTSIZE
 #define TP_FONTSIZE   10.0f
+#endif
 #define TP_LINESTEP   12.0f              /* 6 lines per inch         */
 
 #define TP_ST_NORMAL     0x00
@@ -225,10 +242,14 @@ static ULONG               g_nrows;      /* rows accumulated so far*/
 #define TP_ST_ITALIC     0x02
 #define TP_ST_UNDERLINE  0x04
 
+#define TP_COL_UNSET     0xFF            /* color index: default   */
+
 struct TCell {
     char  ch;                            /* character code         */
     UBYTE st;                            /* TP_ST_* attributes     */
     UBYTE lk;                            /* link id (0 = none)     */
+    UBYTE fg;                            /* color idx, UNSET=default */
+    UBYTE bg;                            /* color idx, UNSET=default */
 };
 
 static struct TCell  g_txt[TP_MAXLINES][TP_MAXCOL];
@@ -238,6 +259,18 @@ static int           g_txtcol;              /* current column count  */
 static int           g_txtactive;          /* any text this page     */
 static int           g_txtcr;               /* CR pending (CRLF pair) */
 static UBYTE         g_txtstyle;            /* current TP_ST_* attrs  */
+static UBYTE         g_fg, g_bg;            /* current fg/bg color idx */
+
+/* Per-page color registry: cells hold a UBYTE index (unset 0xFF).
+ * Reset in text_reset() along with the text buffer. */
+#define TP_MAXCOLORS  256
+static UBYTE g_colors[TP_MAXCOLORS][3];
+static int   g_ncolors;
+
+/* Optional 8-bit charset table (ped_8BitChars), applied to codes
+ * >= 0x80 in text_char(). */
+static const UBYTE *g_charmap;
+static HPDF_REAL    g_fontsize;          /* point size for job      */
 
 /* Hyperlinks: OSC-8 regions (explicit) and auto-detected URLs are
  * emitted as PDF URI link annotations. */
@@ -373,6 +406,7 @@ static void pdf_page_setup(struct PrinterData *pd)
     g_right     = TP_PAGE_W - TP_MARGIN;
     g_line_step = TP_LINESTEP;
     g_max_lines = TP_MAXLINES;
+    g_fontsize  = TP_FONTSIZE;
 
     pr = &pd->pd_Preferences;
 
@@ -384,11 +418,13 @@ static void pdf_page_setup(struct PrinterData *pd)
         }
     }
 
-    switch (pr->PrintPitch & 0xC00) {     /* char width at pitch */
-    case ELITE: cw = 72.0f / 12.0f; break;
-    case FINE:  cw = 72.0f / 17.0f; break;
+    /* Char width at pitch, and a matching point size so a finer pitch
+     * prints smaller glyphs (PICA keeps the TP_FONTSIZE default). */
+    switch (pr->PrintPitch & 0xC00) {
+    case ELITE: cw = 72.0f / 12.0f; g_fontsize =  8.5f; break;
+    case FINE:  cw = 72.0f / 17.0f; g_fontsize =  7.0f; break;
     case PICA:
-    default:    cw = 72.0f / 10.0f; break;
+    default:    cw = 72.0f / 10.0f; g_fontsize = TP_FONTSIZE; break;
     }
 
     g_left  = (HPDF_REAL)pr->PrintLeftMargin  * cw;
@@ -415,6 +451,9 @@ static void text_reset(void)
     g_txtactive = 0;
     g_txtcr     = 0;
     g_txtstyle  = TP_ST_NORMAL;
+    g_fg        = TP_COL_UNSET;
+    g_bg        = TP_COL_UNSET;
+    g_ncolors   = 0;
     g_osc       = OSC_IDLE;
     g_osclen    = 0;
     g_csil      = 0;
@@ -578,19 +617,24 @@ static int pdf_add_text(void)
             fnt     = text_font(g_doc, g_txt[i][j].st);
             if (!fnt) continue;
             x += (HPDF_REAL)HPDF_Font_TextWidth(fnt, &cbuf, 1).width *
-                 TP_FONTSIZE / 1000.0f;
+                 g_fontsize / 1000.0f;
         }
         cumx[len] = x;                    /* right edge incl. last cell */
 
-        /* Draw runs (split on style OR explicit link). */
+        /* Draw runs (split on style, link, or color). */
         j = 0;
         while (j < len && cumx[j] < g_right) {
             UBYTE st = g_txt[i][j].st;
             UBYTE lk = g_txt[i][j].lk;
+            UBYTE fg = g_txt[i][j].fg;
+            UBYTE bg = g_txt[i][j].bg;
 
             n = 0;
-            while (j + n < len && g_txt[i][j + n].st == st &&
-                   g_txt[i][j + n].lk == lk) {
+            while (j + n < len &&
+                   g_txt[i][j + n].st == st &&
+                   g_txt[i][j + n].lk == lk &&
+                   g_txt[i][j + n].fg == fg &&
+                   g_txt[i][j + n].bg == bg) {
                 runbuf[n] = g_txt[i][j + n].ch;
                 n++;
             }
@@ -598,16 +642,47 @@ static int pdf_add_text(void)
 
             fnt = text_font(g_doc, st);
             if (fnt) {
+                /* Background: a filled rectangle under the run. */
+                if (bg != TP_COL_UNSET) {
+                    HPDF_Page_SetRGBFill(pg,
+                        (HPDF_REAL)g_colors[bg][0] / 255.0f,
+                        (HPDF_REAL)g_colors[bg][1] / 255.0f,
+                        (HPDF_REAL)g_colors[bg][2] / 255.0f);
+                    asc  = (HPDF_REAL)HPDF_Font_GetAscent(fnt)  *
+                           g_fontsize / 1000.0f;
+                    desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) *
+                           g_fontsize / 1000.0f;
+                    if (cumx[j + n] > g_right) cumx[j + n] = g_right;
+                    HPDF_Page_Rectangle(pg, cumx[j], y - desc,
+                                        cumx[j + n] - cumx[j], asc + desc);
+                    HPDF_Page_Fill(pg);
+                }
+
                 HPDF_Page_BeginText(pg);
-                HPDF_Page_SetFontAndSize(pg, fnt, TP_FONTSIZE);
+                HPDF_Page_SetFontAndSize(pg, fnt, g_fontsize);
+                if (fg != TP_COL_UNSET) {
+                    HPDF_Page_SetRGBFill(pg,
+                        (HPDF_REAL)g_colors[fg][0] / 255.0f,
+                        (HPDF_REAL)g_colors[fg][1] / 255.0f,
+                        (HPDF_REAL)g_colors[fg][2] / 255.0f);
+                } else {
+                    HPDF_Page_SetRGBFill(pg, 0, 0, 0);
+                }
                 HPDF_Page_MoveTextPos(pg, cumx[j], y);
                 HPDF_Page_ShowText(pg, runbuf);
                 HPDF_Page_EndText(pg);
 
                 if (st & TP_ST_UNDERLINE) {
+                    HPDF_Page_SetRGBStroke(pg,
+                        (HPDF_REAL)(fg != TP_COL_UNSET ? g_colors[fg][0]
+                                                       : 0) / 255.0f,
+                        (HPDF_REAL)(fg != TP_COL_UNSET ? g_colors[fg][1]
+                                                       : 0) / 255.0f,
+                        (HPDF_REAL)(fg != TP_COL_UNSET ? g_colors[fg][2]
+                                                       : 0) / 255.0f);
                     HPDF_Page_SetLineWidth(pg, 0.5f);
-                    HPDF_Page_MoveTo(pg, cumx[j], y - 1.5f);
-                    HPDF_Page_LineTo(pg, cumx[j + n], y - 1.5f);
+                    HPDF_Page_MoveTo(pg, cumx[j], y - g_fontsize * 0.15f);
+                    HPDF_Page_LineTo(pg, cumx[j + n], y - g_fontsize * 0.15f);
                     HPDF_Page_Stroke(pg);
                 }
             }
@@ -616,8 +691,10 @@ static int pdf_add_text(void)
             if (lk && lk <= g_nlinks && fnt) {
                 HPDF_Rect r;
 
-                asc  = (HPDF_REAL)HPDF_Font_GetAscent(fnt)  * TP_FONTSIZE / 1000.0f;
-                desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) * TP_FONTSIZE / 1000.0f;
+                asc  = (HPDF_REAL)HPDF_Font_GetAscent(fnt)  *
+                       g_fontsize / 1000.0f;
+                desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) *
+                       g_fontsize / 1000.0f;
                 if (cumx[j + n] > g_right) cumx[j + n] = g_right;
                 r.left   = cumx[j];
                 r.bottom = y - desc;
@@ -648,8 +725,10 @@ static int pdf_add_text(void)
                 if (fnt) {
                     HPDF_Rect r;
 
-                    asc  = (HPDF_REAL)HPDF_Font_GetAscent(fnt)  * TP_FONTSIZE / 1000.0f;
-                    desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) * TP_FONTSIZE / 1000.0f;
+                    asc  = (HPDF_REAL)HPDF_Font_GetAscent(fnt)  *
+                           g_fontsize / 1000.0f;
+                    desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) *
+                           g_fontsize / 1000.0f;
                     x = cumx[s];
                     w = cumx[s + k];
                     if (w > g_right) w = g_right;
@@ -724,6 +803,8 @@ static int text_char(UBYTE c)
             g_txt[g_txtsln][g_txtcol].ch = ' ';
             g_txt[g_txtsln][g_txtcol].st = g_txtstyle;
             g_txt[g_txtsln][g_txtcol].lk = g_curlink;
+            g_txt[g_txtsln][g_txtcol].fg = g_fg;
+            g_txt[g_txtsln][g_txtcol].bg = g_bg;
             g_txtcol++;
         } while (g_txtcol % 8);
         return 1;
@@ -731,10 +812,14 @@ static int text_char(UBYTE c)
     default:
         if (c < 0x20)                      /* swallow other controls */
             return 1;
+        if (g_charmap && c >= 0x80)        /* 8-bit charset table */
+            c = g_charmap[c - 0x80];
         if (g_txtcol < TP_MAXCOL - 1) {
             g_txt[g_txtsln][g_txtcol].ch = (char)c;
             g_txt[g_txtsln][g_txtcol].st = g_txtstyle;
             g_txt[g_txtsln][g_txtcol].lk = g_curlink;
+            g_txt[g_txtsln][g_txtcol].fg = g_fg;
+            g_txt[g_txtsln][g_txtcol].bg = g_bg;
             g_txtcol++;
             g_txtactive = 1;
         }
@@ -749,6 +834,88 @@ static void text_flush(void)
     text_reset();
 }
 
+/* ANSI SGR palette (index 0..15: 30-37 / 90-97 base colors). */
+static const UBYTE sg_ansi[16][3] = {
+    {   0,   0,   0 },                /*  0 black      */
+    { 205,   0,   0 },                /*  1 red        */
+    {   0, 205,   0 },                /*  2 green      */
+    { 205, 205,   0 },                /*  3 yellow     */
+    {   0,   0, 238 },                /*  4 blue       */
+    { 205,   0, 205 },                /*  5 magenta    */
+    {   0, 205, 205 },                /*  6 cyan       */
+    { 229, 229, 229 },                /*  7 white      */
+    { 127, 127, 127 },                /*  8 brightblack*/
+    { 255,   0,   0 },                /*  9 bright red */
+    {   0, 255,   0 },                /* 10 bright grn */
+    { 255, 255,   0 },                /* 11 bright ylw */
+    {  92,  92, 255 },                /* 12 bright blue*/
+    { 255,   0, 255 },                /* 13 bright mag */
+    {   0, 255, 255 },                /* 14 bright cyn */
+    { 255, 255, 255 },                /* 15 bright whit*/
+};
+
+/* Map an xterm 256-color index to RGB (16 ANSI + 6x6x6 cube + 24 gray). */
+static void xterm_rgb(int n, UBYTE *r, UBYTE *g, UBYTE *b)
+{
+    int v;
+
+    if (n < 0) n = 0;
+    if (n > 255) n = 255;
+    if (n < 16) {
+        *r = sg_ansi[n][0];
+        *g = sg_ansi[n][1];
+        *b = sg_ansi[n][2];
+    } else if (n < 232) {
+        v   = n - 16;
+        *r  = (UBYTE)((v / 36)      ? 55 + (v / 36)      * 40 : 0);
+        *g  = (UBYTE)(((v / 6) % 6) ? 55 + ((v / 6) % 6) * 40 : 0);
+        *b  = (UBYTE)((v % 6)       ? 55 + (v % 6)       * 40 : 0);
+    } else {
+        v   = 8 + (n - 232) * 10;
+        *r  = *g = *b = (UBYTE)v;
+    }
+}
+
+/* Register an RGB colour and return its per-page index (UBYTE).
+ * Best-effort: returns TP_COL_UNSET when the pool is exhausted. */
+static UBYTE color_reg(UBYTE r, UBYTE g, UBYTE b)
+{
+    int i;
+
+    for (i = 0; i < g_ncolors; i++)
+        if (g_colors[i][0] == r && g_colors[i][1] == g &&
+            g_colors[i][2] == b)
+            return (UBYTE)i;
+    if (g_ncolors >= TP_MAXCOLORS)
+        return TP_COL_UNSET;
+    g_colors[g_ncolors][0] = r;
+    g_colors[g_ncolors][1] = g;
+    g_colors[g_ncolors][2] = b;
+    return (UBYTE)(g_ncolors++);
+}
+
+static void color_fg_rgb(UBYTE r, UBYTE g, UBYTE b)
+{ g_fg = color_reg(r, g, b); }
+
+static void color_bg_rgb(UBYTE r, UBYTE g, UBYTE b)
+{ g_bg = color_reg(r, g, b); }
+
+static void color_fg_n(unsigned n)
+{
+    UBYTE r, g, b;
+
+    xterm_rgb((int)n, &r, &g, &b);
+    g_fg = color_reg(r, g, b);
+}
+
+static void color_bg_n(unsigned n)
+{
+    UBYTE r, g, b;
+
+    xterm_rgb((int)n, &r, &g, &b);
+    g_bg = color_reg(r, g, b);
+}
+
 /* Apply one SGR/ANSI style command code (aSGR0..aSGR24 / aRIS).
  * Shared by ped_DoSpecial (7-bit commands from printer.device) and the
  * 8-bit CSI parser in ped_convfunc. */
@@ -758,6 +925,8 @@ static void style_set(UBYTE code)
     case aRIS:
     case aSGR0:                          /* attributes off */
         g_txtstyle = TP_ST_NORMAL;
+        g_fg       = TP_COL_UNSET;
+        g_bg       = TP_COL_UNSET;
         break;
     case aSGR1:                          /* bold */
         g_txtstyle |= TP_ST_BOLD;
@@ -868,37 +1037,70 @@ static int ped_convfunc(UBYTE *buf, UBYTE c, LONG crlf_flag)
                 g_csibuf[g_csil++] = (char)c;
             return 0;
         }
-        if (c == 'm') {                   /* SGR applies styles      */
-            int val, any;
+        if (c == 'm') {                   /* SGR: styles + colors  */
+            int   vals[TP_CSIMAX / 2 + 1], nv = 0, v = -1;
             char *p;
 
             g_csibuf[g_csil] = '\0';
-            p   = g_csibuf;
-            val = 0;
-            any = 0;
-            for (;;) {
+            for (p = g_csibuf; *p; p++) {
                 if (*p >= '0' && *p <= '9') {
-                    val = val * 10 + (*p - '0');
-                    any = 1;
-                } else if (*p == ';' || *p == '\0') {
-                    if (any) {
-                        switch (val) {    /* SGR number -> aSGR code  */
-                        case 0:  style_set(aSGR0);  break;
-                        case 1:  style_set(aSGR1);  break;
-                        case 3:  style_set(aSGR3);  break;
-                        case 4:  style_set(aSGR4);  break;
-                        case 22: style_set(aSGR22); break;
-                        case 23: style_set(aSGR23); break;
-                        case 24: style_set(aSGR24); break;
-                        default: break;   /* unsupported SGR: ignore */
-                        }
-                        val = 0;
-                        any = 0;
-                    }
-                    if (*p == '\0')
-                        break;
+                    if (v < 0) v = 0;
+                    v = v * 10 + (*p - '0');
+                } else if (*p == ';' || *p == ':') {
+                    if (v >= 0 && nv < (int)(sizeof vals / sizeof vals[0]))
+                        vals[nv++] = v;
+                    v = -1;
                 }
-                p++;
+            }
+            if (v >= 0 && nv < (int)(sizeof vals / sizeof vals[0]))
+                vals[nv++] = v;
+
+            for (int i = 0; i < nv; i++) {
+                switch (vals[i]) {
+                case 0:  style_set(aSGR0);  break;
+                case 1:  style_set(aSGR1);  break;
+                case 3:  style_set(aSGR3);  break;
+                case 4:  style_set(aSGR4);  break;
+                case 22: style_set(aSGR22); break;
+                case 23: style_set(aSGR23); break;
+                case 24: style_set(aSGR24); break;
+                case 39: g_fg = TP_COL_UNSET;               break;
+                case 49: g_bg = TP_COL_UNSET;               break;
+                case 38:                      /* 256-color / RGB fg */
+                    if (i + 1 < nv && vals[i + 1] == 5 && i + 2 < nv) {
+                        color_fg_n((unsigned)vals[i + 2]);
+                        i += 2;
+                    } else if (i + 1 < nv && vals[i + 1] == 2 &&
+                               i + 4 < nv) {
+                        color_fg_rgb((UBYTE)vals[i + 2],
+                                     (UBYTE)vals[i + 3],
+                                     (UBYTE)vals[i + 4]);
+                        i += 4;
+                    }
+                    break;
+                case 48:                      /* 256-color / RGB bg */
+                    if (i + 1 < nv && vals[i + 1] == 5 && i + 2 < nv) {
+                        color_bg_n((unsigned)vals[i + 2]);
+                        i += 2;
+                    } else if (i + 1 < nv && vals[i + 1] == 2 &&
+                               i + 4 < nv) {
+                        color_bg_rgb((UBYTE)vals[i + 2],
+                                     (UBYTE)vals[i + 3],
+                                     (UBYTE)vals[i + 4]);
+                        i += 4;
+                    }
+                    break;
+                default:                      /* ANSI base/bright */
+                    if (vals[i] >= 30 && vals[i] <= 37)
+                        color_fg_n((unsigned)(vals[i] - 30));
+                    else if (vals[i] >= 90 && vals[i] <= 97)
+                        color_fg_n((unsigned)(vals[i] - 90 + 8));
+                    else if (vals[i] >= 40 && vals[i] <= 47)
+                        color_bg_n((unsigned)(vals[i] - 40));
+                    else if (vals[i] >= 100 && vals[i] <= 107)
+                        color_bg_n((unsigned)(vals[i] - 100 + 8));
+                    break;
+                }
             }
         }
         g_osc = OSC_IDLE;
@@ -918,6 +1120,7 @@ static int ped_init(struct PrinterData *pd)
     g_doc      = NULL;
     g_req      = NULL;
     g_npages   = 0;
+    g_charmap  = (const UBYTE *)sg.ps_PED.ped_8BitChars;
     pdf_page_setup(pd);
     text_reset();
     return 0;
@@ -945,6 +1148,7 @@ static int ped_open(struct IORequest *ior)
 
     if (g_pd) pdf_page_setup(g_pd);       /* device may have re-prefs */
     g_npages   = 0;
+    g_charmap  = (const UBYTE *)sg.ps_PED.ped_8BitChars;
     text_reset();
     return 0;
 }
