@@ -1,3 +1,4 @@
+HPDF_SetInfoAttr(pdf, HPDF_INFO_CREATOR, "TurboPDF");
 TurboPDF — TurboPrint-compatible PDF printer driver for MorphOS/AmigaOS
 =======================================================================
 
@@ -68,26 +69,26 @@ Three data paths:
     spaces and the Latin-1 range `0xA0..0xFF` keeps its glyph, so
     accented text prints correctly.
 
-    **Hyperlinks** — text URLs become clickable PDF links:
-      * Auto-detection: `http://`, `https://`, `ftp://` and `www.`
-        tokens in the printed text get a URI link annotation matching
-        the rendered glyphs (trailing sentence punctuation trimmed).
-      * OSC 8 (terminal hyperlinks): an explicit link is opened and
-        closed in the character stream with
-        `ESC ] 8 ; <id> ; <uri> BEL` (or `ESC ] 8 ; ; <uri> ESC \ `) and
-        closed with an empty URI.  The region gets a URI link
-        annotation with the given URI.  An open link also survives a
-        formfeed so multi-line hyperlinks keep working.  `ESC]` is not
-        a standard printer escape, so printer.device passes the sequence
-        through unmodified for the driver's `ped_ConvFunc` to consume
-        (it never appears on the printed page).
-      * 8-bit ECMA-48 forms are recognised as well: CSI `0x9B` and OSC
-        `0x9D`, terminated by ST `0x9C` (BEL for OSC).  `ped_ConvFunc`
-        parses `0x9B <params> m` with the same SGR mapping as the table
-        commands (0,1,3,4,22,23,24 -> aSGR0..aSGR24) plus the full color
-        subset above, and routes `0x9D` through the same OSC-8 parser as
-        the 7-bit `ESC]` form.  Both 8-bit controls are dropped before
-        they can reach the text.
+  **Hyperlinks** — text URLs become clickable PDF links:
+  * Auto-detection: `http://`, `https://`, `ftp://` and `www.`
+    tokens in the printed text get a URI link annotation matching
+    the rendered glyphs (trailing sentence punctuation trimmed).
+  * OSC 8 (terminal hyperlinks): an explicit link is opened and
+    closed in the character stream with
+    `ESC ] 8 ; <id> ; <uri> BEL` (or `ESC ] 8 ; ; <uri> ESC \ `) and
+    closed with an empty URI.  The region gets a URI link
+    annotation with the given URI.  An open link also survives a
+    formfeed so multi-line hyperlinks keep working.  `ESC]` is not
+    a standard printer escape, so printer.device passes the sequence
+    through unmodified for the driver's `ped_ConvFunc` to consume
+    (it never appears on the printed page).
+  * 8-bit ECMA-48 forms are recognised as well: CSI `0x9B` and OSC
+    `0x9D`, terminated by ST `0x9C` (BEL for OSC).  `ped_ConvFunc`
+    parses `0x9B <params> m` with the same SGR mapping as the table
+    commands (0,1,3,4,22,23,24 -> aSGR0..aSGR24) plus the full color
+    subset above, and routes `0x9D` through the same OSC-8 parser as
+    the 7-bit `ESC]` form.  Both 8-bit controls are dropped before
+    they can reach the text.
 
   **TurboPrint path** (PRD_TPEXTDUMPRPORT → DoSpecial)
     The driver reads the raster bitmap passed in the `TPExtIODRP`
