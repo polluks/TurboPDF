@@ -1146,6 +1146,8 @@ static int ped_open(struct IORequest *ior)
     g_doc = HPDF_New(NULL, NULL);
     if (!g_doc) return -1;
 
+    HPDF_SetInfoAttr(g_doc, HPDF_INFO_CREATOR, "TurboPDF");
+
     if (g_pd) pdf_page_setup(g_pd);       /* device may have re-prefs */
     g_npages   = 0;
     g_charmap  = (const UBYTE *)sg.ps_PED.ped_8BitChars;

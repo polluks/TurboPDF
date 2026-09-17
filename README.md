@@ -1,4 +1,3 @@
-HPDF_SetInfoAttr(pdf, HPDF_INFO_CREATOR, "TurboPDF");
 TurboPDF — TurboPrint-compatible PDF printer driver for MorphOS/AmigaOS
 =======================================================================
 
@@ -181,12 +180,12 @@ PrinterSegment docs
 
 TODO
 
-[ ] Test on real MorphOS hardware.
-[ ] Implement planar → RGB conversion in Render() for classic Amiga bitmaps.
-[ ] Investigate per-PrinterData state for concurrent printer instances.
-[ ] Top/bottom page margins: Preferences exposes no vertical-margin field
-    (top-of-form is fixed by the device), so a constant margin is used.
-[ ] Justification/centering: printer.device delivers text pre-formatted and
-    provides no alignment control channel, so text is always left-aligned.
-[ ] `pf_PrintColor` is not consulted — the color class is PPCF_COLOR and SGR
-    colors are always honoured.
+- [ ] Test on real MorphOS hardware.
+- [ ] Implement planar → RGB conversion in Render() for classic Amiga bitmaps.
+- [ ] Investigate per-PrinterData state for concurrent printer instances.
+- [ ] Top/bottom page margins: Preferences exposes no vertical-margin field
+      (top-of-form is fixed by the device), so a constant margin is used.
+- [ ] Justification/centering: printer.device delivers text pre-formatted and
+      provides no alignment control channel, so text is always left-aligned.
+- [ ] `pf_PrintColor` is not consulted — the color class is PPCF_COLOR and SGR
+      colors are always honoured.
