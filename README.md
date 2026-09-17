@@ -89,6 +89,30 @@ Three data paths:
     the 7-bit `ESC]` form.  Both 8-bit controls are dropped before
     they can reach the text.
 
+    **Alignment** is set with the ECMA-48 justification sequence
+    `ESC [ <ps> SP F` (`0x9B <ps> 0x20 F` in 8-bit form).  It applies
+    to the whole line that follows:
+    `6` flushes left (default), `7` centres, `8` flushes right,
+    `2` justifies (word fill, distributing the leftover space across
+    the gaps between words), and `1` ends justification and returns
+    to flush left.  A line wider than the printable area stays flush
+    left.  Alignment interacts with styles, colors and both link
+    schemes (rects shift with the line).
+
+    **PDF passthrough** (aESTEND / extended command) — arbitrary PDF
+    operators can be embedded verbatim in the output.  Send the
+    extended-command escape `ESC [ <n> " x` (aEXTEND, ANSI command 75)
+    followed by `<n>` bytes of raw PDF content; the driver writes them
+    straight into a dedicated page's content stream.  `<n>` bytes are
+    consumed, then text mode resumes (the count makes the block
+    self-terminating).  Consecutive extended commands keep appending to
+    the same page, so each chunk must be balanced (`BT`/`ET` or `q`/`Q`,
+    etc.).  This mirrors the standard "extended commands" feature of
+    the Amiga PostScript driver.  Requires the bundled libharu
+    extension `HPDF_Page_AppendRaw` (present in the static build; the
+    weak reference degrades to a no-op against the system
+    `hpdf.library`).
+
   **TurboPrint path** (PRD_TPEXTDUMPRPORT → DoSpecial)
     The driver reads the raster bitmap passed in the `TPExtIODRP`
     request and embeds it as a raw RGB image via `HPDF_LoadRawImageFromMem`.
@@ -185,7 +209,5 @@ TODO
 - [ ] Investigate per-PrinterData state for concurrent printer instances.
 - [ ] Top/bottom page margins: Preferences exposes no vertical-margin field
       (top-of-form is fixed by the device), so a constant margin is used.
-- [ ] Justification/centering: printer.device delivers text pre-formatted and
-      provides no alignment control channel, so text is always left-aligned.
 - [ ] `pf_PrintColor` is not consulted — the color class is PPCF_COLOR and SGR
       colors are always honoured.

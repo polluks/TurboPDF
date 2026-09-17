@@ -11,6 +11,9 @@
  *   - Text mode: printable characters arrive via ped_ConvFunc (V34+);
  *     lines accumulate and are emitted as PDF pages, sized to the
  *     paper selection from Preferences (US Letter, A4/A5..A0, etc.).
+ *     Raw PDF operators can be injected with the aESTEND extended
+ *     command (ESC [ <n> " x): the next n stream characters are
+ *     appended verbatim to a dedicated page content stream.
  *   - PRD_TPEXTDUMPRPORT (TurboPrint, via DoSpecial)
  *   - PRD_DUMPRPORT (standard, via Render)
  * The two graphics paths convert the source bitmap to RGB24 and embed
@@ -30,6 +33,14 @@
 
 #include "turboprint.h"
 
+/* TurboPDF libharu extension (HPDF_Page_AppendRaw).  The reference is
+ * weak so drivers linked against the system hpdf.library, which has no
+ * such symbol, still load: the feature then degrades to a no-op. */
+extern HPDF_STATUS HPDF_Page_AppendRaw(HPDF_Page page,
+                                       const HPDF_BYTE *buf,
+                                       HPDF_UINT size)
+    __attribute__((weak));
+
 #define STR_(s) #s
 #define STR(s)  STR_(s)
 
@@ -47,6 +58,7 @@
 #define aSGR24  9
 #define aSGR1   10
 #define aSGR22  11
+#define aEXTEND 75
 #define aRAW    76
 
 /* Paper-size / pitch / spacing codes (intuition/preferences.h).
@@ -180,6 +192,7 @@ static const STRPTR sg_cmds[TEXT_NUM_CMDS] = {
     [aSGR23] = "\377",   /* italic off                */
     [aSGR4]  = "\377",   /* underline                 */
     [aSGR24] = "\377",   /* underline off             */
+    [aEXTEND] = "\377",  /* Esc [ <n> " x: PDF code    */
 };
 
 const struct PrinterSegment sg __attribute__((used, section(".text"))) = {
@@ -220,6 +233,12 @@ static HPDF_Doc            g_doc;        /* current PDF document   */
 static struct IORequest   *g_req;        /* current IORequest      */
 static int                 g_npages;     /* pages in current doc   */
 
+/* Raw PDF passthrough (aESTEND / extended command):
+ * aEXTEND carries a byte count; the next <n> characters of the text
+ * stream are appended verbatim to the current page content stream. */
+static HPDF_Page           g_rawpage;    /* page receiving raw code */
+static HPDF_UINT           g_rawleft;    /* passthrough bytes left  */
+
 /* Per-page band accumulation (Render path) */
 static UBYTE              *g_rowbuf;     /* accumulated RGB24 rows */
 static ULONG               g_rowbufsz;   /* allocated bytes        */
@@ -244,6 +263,12 @@ static ULONG               g_nrows;      /* rows accumulated so far*/
 
 #define TP_COL_UNSET     0xFF            /* color index: default   */
 
+/* Text alignment (ECMA-48 JFY, CSI Ps SP F). */
+#define TP_JUST_LEFT     0
+#define TP_JUST_CENTER   1
+#define TP_JUST_RIGHT    2
+#define TP_JUST_FILL     3                /* word fill (justify)    */
+
 struct TCell {
     char  ch;                            /* character code         */
     UBYTE st;                            /* TP_ST_* attributes     */
@@ -260,6 +285,9 @@ static int           g_txtactive;          /* any text this page     */
 static int           g_txtcr;               /* CR pending (CRLF pair) */
 static UBYTE         g_txtstyle;            /* current TP_ST_* attrs  */
 static UBYTE         g_fg, g_bg;            /* current fg/bg color idx */
+static UBYTE         g_just;               /* alignment of new lines */
+static UBYTE         g_linejust[TP_MAXLINES]; /* per-line alignment   */
+static int           g_csimid;             /* CSI intermediate seen  */
 
 /* Per-page color registry: cells hold a UBYTE index (unset 0xFF).
  * Reset in text_reset() along with the text buffer. */
@@ -454,6 +482,9 @@ static void text_reset(void)
     g_fg        = TP_COL_UNSET;
     g_bg        = TP_COL_UNSET;
     g_ncolors   = 0;
+    g_just      = TP_JUST_LEFT;
+    g_csimid    = 0;
+    memset(g_linejust, 0, sizeof g_linejust);
     g_osc       = OSC_IDLE;
     g_osclen    = 0;
     g_csil      = 0;
@@ -569,6 +600,11 @@ static int text_url_end(int line, int len, int s)
     return (e - s > 5) ? e - s : 0;
 }
 
+static void line_align(int line, int len, const HPDF_REAL adv[TP_MAXCOL],
+                       HPDF_REAL cumx[TP_MAXCOL], HPDF_REAL *xo);
+static int  pdf_passthrough_start(const UBYTE *params);
+static void pdf_passthrough_byte(HPDF_BYTE c);
+
 /* Emit the accumulated lines as PDF text pages, splitting each line
  * into runs that share style + explicit link id.  Auto-detected URLs
  * (cells with no explicit link) and OSC-8 regions become URI link
@@ -576,8 +612,9 @@ static int text_url_end(int line, int len, int s)
 static int pdf_add_text(void)
 {
     HPDF_Page      pg;
-    HPDF_REAL      y, x, w, asc, desc;
+    HPDF_REAL      y, x, w, asc, desc, xo;
     HPDF_REAL      cumx[TP_MAXCOL];
+    HPDF_REAL      adv[TP_MAXCOL];
     HPDF_Font      fnt;
     HPDF_BYTE      cbuf;
     char           runbuf[TP_MAXCOL + 1];
@@ -615,15 +652,18 @@ static int pdf_add_text(void)
             cumx[j] = x;
             cbuf    = (HPDF_BYTE)(UBYTE)g_txt[i][j].ch;
             fnt     = text_font(g_doc, g_txt[i][j].st);
-            if (!fnt) continue;
-            x += (HPDF_REAL)HPDF_Font_TextWidth(fnt, &cbuf, 1).width *
-                 g_fontsize / 1000.0f;
+            if (!fnt) { adv[j] = 0; continue; }
+            adv[j]  = (HPDF_REAL)HPDF_Font_TextWidth(fnt, &cbuf, 1).width *
+                      g_fontsize / 1000.0f;
+            x      += adv[j];
         }
         cumx[len] = x;                    /* right edge incl. last cell */
 
+        line_align(i, len, adv, cumx, &xo);
+
         /* Draw runs (split on style, link, or color). */
         j = 0;
-        while (j < len && cumx[j] < g_right) {
+        while (j < len && cumx[j] + xo < g_right) {
             UBYTE st = g_txt[i][j].st;
             UBYTE lk = g_txt[i][j].lk;
             UBYTE fg = g_txt[i][j].fg;
@@ -644,6 +684,7 @@ static int pdf_add_text(void)
             if (fnt) {
                 /* Background: a filled rectangle under the run. */
                 if (bg != TP_COL_UNSET) {
+                    HPDF_REAL xr = cumx[j + n] + xo;
                     HPDF_Page_SetRGBFill(pg,
                         (HPDF_REAL)g_colors[bg][0] / 255.0f,
                         (HPDF_REAL)g_colors[bg][1] / 255.0f,
@@ -652,9 +693,9 @@ static int pdf_add_text(void)
                            g_fontsize / 1000.0f;
                     desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) *
                            g_fontsize / 1000.0f;
-                    if (cumx[j + n] > g_right) cumx[j + n] = g_right;
-                    HPDF_Page_Rectangle(pg, cumx[j], y - desc,
-                                        cumx[j + n] - cumx[j], asc + desc);
+                    if (xr > g_right) xr = g_right;
+                    HPDF_Page_Rectangle(pg, cumx[j] + xo, y - desc,
+                                        xr - (cumx[j] + xo), asc + desc);
                     HPDF_Page_Fill(pg);
                 }
 
@@ -668,7 +709,7 @@ static int pdf_add_text(void)
                 } else {
                     HPDF_Page_SetRGBFill(pg, 0, 0, 0);
                 }
-                HPDF_Page_MoveTextPos(pg, cumx[j], y);
+                HPDF_Page_MoveTextPos(pg, cumx[j] + xo, y);
                 HPDF_Page_ShowText(pg, runbuf);
                 HPDF_Page_EndText(pg);
 
@@ -681,8 +722,10 @@ static int pdf_add_text(void)
                         (HPDF_REAL)(fg != TP_COL_UNSET ? g_colors[fg][2]
                                                        : 0) / 255.0f);
                     HPDF_Page_SetLineWidth(pg, 0.5f);
-                    HPDF_Page_MoveTo(pg, cumx[j], y - g_fontsize * 0.15f);
-                    HPDF_Page_LineTo(pg, cumx[j + n], y - g_fontsize * 0.15f);
+                    HPDF_Page_MoveTo(pg, cumx[j] + xo,
+                                     y - g_fontsize * 0.15f);
+                    HPDF_Page_LineTo(pg, cumx[j + n] + xo,
+                                     y - g_fontsize * 0.15f);
                     HPDF_Page_Stroke(pg);
                 }
             }
@@ -690,15 +733,16 @@ static int pdf_add_text(void)
             /* Explicit OSC-8 region: one URI annotation per run. */
             if (lk && lk <= g_nlinks && fnt) {
                 HPDF_Rect r;
+                HPDF_REAL xr = cumx[j + n] + xo;
 
                 asc  = (HPDF_REAL)HPDF_Font_GetAscent(fnt)  *
                        g_fontsize / 1000.0f;
                 desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) *
                        g_fontsize / 1000.0f;
-                if (cumx[j + n] > g_right) cumx[j + n] = g_right;
-                r.left   = cumx[j];
+                if (xr > g_right) xr = g_right;
+                r.left   = cumx[j] + xo;
                 r.bottom = y - desc;
-                r.right  = cumx[j + n];
+                r.right  = xr;
                 r.top    = y + asc;
                 HPDF_Page_CreateURILinkAnnot(pg, r, g_links[lk - 1]);
             }
@@ -708,7 +752,7 @@ static int pdf_add_text(void)
 
         /* Auto-detect URLs on unlinked cells. */
         s = 0;
-        while (s < len && cumx[s] < g_right) {
+        while (s < len && cumx[s] + xo < g_right) {
             if (g_txt[i][s].lk) {
                 s++;
                 continue;
@@ -729,8 +773,8 @@ static int pdf_add_text(void)
                            g_fontsize / 1000.0f;
                     desc = (HPDF_REAL)-HPDF_Font_GetDescent(fnt) *
                            g_fontsize / 1000.0f;
-                    x = cumx[s];
-                    w = cumx[s + k];
+                    x = cumx[s] + xo;
+                    w = cumx[s + k] + xo;
                     if (w > g_right) w = g_right;
                     r.left   = x;
                     r.bottom = y - desc;
@@ -768,7 +812,8 @@ static void text_newline(void)
         pdf_add_text();
         text_reset();
     }
-    g_txtlen[g_txtsln] = g_txtcol;
+    g_txtlen[g_txtsln]    = g_txtcol;
+    g_linejust[g_txtsln]  = g_just;       /* alignment of this line   */
     g_txtsln++;
     g_txtcol = 0;
     g_txtactive = 1;
@@ -916,6 +961,84 @@ static void color_bg_n(unsigned n)
     g_bg = color_reg(r, g, b);
 }
 
+/* ECMA-48 JFY -- CSI Ps SP F (justification).  1=end, 2=fill, 6=left,
+ * 7=centre, 8=right.  Sets the alignment of lines started from here on. */
+static void text_just_apply(void)
+{
+    int   vals[TP_CSIMAX / 2 + 1], nv = 0, v = -1;
+    char *p;
+
+    g_csibuf[g_csil] = '\0';
+    for (p = g_csibuf; *p; p++) {
+        if (*p >= '0' && *p <= '9') {
+            if (v < 0) v = 0;
+            v = v * 10 + (*p - '0');
+        } else if (*p == ';' || *p == ':') {
+            if (v >= 0 && nv < (int)(sizeof vals / sizeof vals[0]))
+                vals[nv++] = v;
+            v = -1;
+        }
+    }
+    if (v >= 0 && nv < (int)(sizeof vals / sizeof vals[0]))
+        vals[nv++] = v;
+
+    for (int i = 0; i < nv; i++) {
+        switch (vals[i]) {
+        case 1:  g_just = TP_JUST_LEFT;   break;
+        case 2:  g_just = TP_JUST_FILL;   break;
+        case 6:  g_just = TP_JUST_LEFT;   break;
+        case 7:  g_just = TP_JUST_CENTER; break;
+        case 8:  g_just = TP_JUST_RIGHT;  break;
+        default: break;
+        }
+    }
+}
+
+/* Horizontal alignment for a finalized line.  FILL redistributes the
+ * leftover space over the word gaps (rebuilding cumx[] in place, xo=0);
+ * CENTRE/RIGHT return a whole-line shift xo.  Line wider than the text
+ * area stays flush left. */
+static void line_align(int line, int len, const HPDF_REAL adv[TP_MAXCOL],
+                       HPDF_REAL cumx[TP_MAXCOL], HPDF_REAL *xo)
+{
+    HPDF_REAL tw, free, gap;
+    int       j, nsp;
+
+    *xo = 0.0f;
+    switch (g_linejust[line]) {
+    case TP_JUST_CENTER:
+        tw = cumx[len] - g_left;
+        if (tw < g_right - g_left)
+            *xo = (g_left + g_right - cumx[len]) * 0.5f;
+        break;
+    case TP_JUST_RIGHT:
+        tw = cumx[len] - g_left;
+        if (tw < g_right - g_left)
+            *xo = g_right - cumx[len];
+        break;
+    case TP_JUST_FILL:
+        tw   = cumx[len] - g_left;
+        free = (g_right - g_left) - tw;
+        nsp  = 0;
+        for (j = 0; j < len; j++)
+            if (g_txt[line][j].ch == ' ')
+                nsp++;
+        if (free > 0 && nsp > 0) {
+            gap = free / (HPDF_REAL)nsp;
+            tw  = g_left;
+            for (j = 0; j < len; j++) {
+                cumx[j] = tw;
+                tw += adv[j] +
+                      (g_txt[line][j].ch == ' ' ? gap : 0.0f);
+            }
+            cumx[len] = tw;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 /* Apply one SGR/ANSI style command code (aSGR0..aSGR24 / aRIS).
  * Shared by ped_DoSpecial (7-bit commands from printer.device) and the
  * 8-bit CSI parser in ped_convfunc. */
@@ -960,6 +1083,12 @@ static int ped_convfunc(UBYTE *buf, UBYTE c, LONG crlf_flag)
     (void)buf;
     (void)crlf_flag;
 
+    if (g_rawleft > 0) {                  /* aESTEND PDF passthrough */
+        pdf_passthrough_byte(c);
+        g_rawleft--;
+        return 0;
+    }
+
     switch (g_osc) {
 
     case OSC_IDLE:
@@ -971,6 +1100,7 @@ static int ped_convfunc(UBYTE *buf, UBYTE c, LONG crlf_flag)
         if (c == 0x9B) {                  /* 8-bit CSI (ECMA-48)    */
             g_osc = OSC_CSI;
             g_csil = 0;
+            g_csimid = 0;
             return 0;
         }
         if (c == 0x9D) {                  /* 8-bit OSC              */
@@ -988,6 +1118,7 @@ static int ped_convfunc(UBYTE *buf, UBYTE c, LONG crlf_flag)
         if (c == '[') {
             g_osc = OSC_CSI;
             g_csil = 0;
+            g_csimid = 0;
         } else if (c == ']') {
             g_osc = OSC_CMD;
         } else {
@@ -1031,13 +1162,19 @@ static int ped_convfunc(UBYTE *buf, UBYTE c, LONG crlf_flag)
         g_osc = OSC_IDLE;
         return 0;
 
-    case OSC_CSI:                         /* ANSI CSI parameters      */
+    case OSC_CSI:                         /* ANSI CSI parameters */
         if ((c >= '0' && c <= '9') || c == ';' || c == ':') {
             if (g_csil < TP_CSIMAX - 1)
                 g_csibuf[g_csil++] = (char)c;
             return 0;
         }
-        if (c == 'm') {                   /* SGR: styles + colors  */
+        if (c == ' ') {                   /* intermediate: JFY ' F  */
+            g_csimid = 1;
+            return 0;
+        }
+        if (c == 'F' && g_csimid) {       /* JFY -- justification   */
+            text_just_apply();
+        } else if (c == 'm' && !g_csimid) { /* SGR: styles + colors */
             int   vals[TP_CSIMAX / 2 + 1], nv = 0, v = -1;
             char *p;
 
@@ -1104,6 +1241,7 @@ static int ped_convfunc(UBYTE *buf, UBYTE c, LONG crlf_flag)
             }
         }
         g_osc = OSC_IDLE;
+        g_csimid = 0;
         return 0;
 
     default:
@@ -1151,6 +1289,8 @@ static int ped_open(struct IORequest *ior)
     if (g_pd) pdf_page_setup(g_pd);       /* device may have re-prefs */
     g_npages   = 0;
     g_charmap  = (const UBYTE *)sg.ps_PED.ped_8BitChars;
+    g_rawpage  = NULL;
+    g_rawleft  = 0;
     text_reset();
     return 0;
 }
@@ -1230,6 +1370,44 @@ struct PrinterIORP {
 
 static LONG dospecial_iorp(struct IORequest *ior);
 
+/* Begin a raw-PDF passthrough block (Amiga extended command, aESTEND):
+ * the next <n> characters of the text stream are appended verbatim to
+ * the current page content stream instead of the text accumulator.
+ * Consecutive extended commands keep appending to the same page, so a
+ * chunk must be self-contained (balanced BT/ET, q/Q, ...).  Returns 1
+ * if a page was opened this call. */
+static int pdf_passthrough_start(const UBYTE *params)
+{
+    HPDF_UINT n;
+
+    if (!g_doc)
+        return 0;
+    n = params ? params[0] : 0;
+    if (n == 0)
+        return 0;
+
+    if (!g_rawpage) {
+        HPDF_Page pg = HPDF_AddPage(g_doc);
+
+        if (!pg)
+            return 0;
+        HPDF_Page_SetWidth(pg, g_page_w);
+        HPDF_Page_SetHeight(pg, g_page_h);
+        g_rawpage = pg;
+        g_npages++;
+    }
+    g_rawleft = n;
+    return 1;
+}
+
+/* Route one stream byte into the raw page content stream.  No-op when
+ * linked against an hpdf.library without HPDF_Page_AppendRaw. */
+static void pdf_passthrough_byte(HPDF_BYTE c)
+{
+    if (g_rawpage && HPDF_Page_AppendRaw)
+        HPDF_Page_AppendRaw(g_rawpage, &c, 1);
+}
+
 static LONG ped_dospecial(UWORD *command, UBYTE *out,
                           BYTE *pl_curline, BYTE *pl_spacing,
                           BYTE *pl_crlf, UBYTE *params)
@@ -1241,6 +1419,11 @@ static LONG ped_dospecial(UWORD *command, UBYTE *out,
     (void)pl_spacing;
     (void)pl_crlf;
     (void)params;
+
+    if (code == aEXTEND) {                /* extended command: embed PDF */
+        pdf_passthrough_start(params);
+        return -2;                        /* handled: emit nothing  */
+    }
 
     if (code <= aRAW) {
         style_set((UBYTE)code);           /* SGR attribute command   */
